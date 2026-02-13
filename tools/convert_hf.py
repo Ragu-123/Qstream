@@ -638,10 +638,14 @@ def serialize_tokenizer(tok_data: dict) -> bytes:
         vocab_buf += struct.pack('<H', len(token_bytes))
         vocab_buf += token_bytes
 
-    # Merge data: list of "tokenA tokenB" strings
+    # Merge data: list of "tokenA tokenB" strings OR ["tokenA", "tokenB"] lists
     merge_buf = bytearray()
     for merge_str in tok_data['merges']:
-        parts = merge_str.split(' ', 1)
+        if isinstance(merge_str, list):
+            parts = merge_str
+        else:
+            parts = merge_str.split(' ', 1)
+        
         if len(parts) == 2:
             a = tok_data['vocab'].get(parts[0], 0)
             b = tok_data['vocab'].get(parts[1], 0)
