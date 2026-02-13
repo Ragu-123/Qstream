@@ -759,8 +759,8 @@ class QSFWriter:
                 except Exception as e:
                     return e, None
 
-            # Use 4 workers to balance CPU/IO without OOM
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # Use 16 workers to maximize throughput
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
                 # Map preserves order
                 results = executor.map(process_layer, range(num_layers))
                 
@@ -1363,10 +1363,12 @@ class GptOssLoader(TensorLoader):
             return None
             
         # Move to GPU/Numpy
+        # Move to GPU/Numpy
+        # Ensure float32 for numpy compatibility (fixes BFloat16 error)
         if getattr(exp_bias, 'is_cuda', False):
-             exp_bias = exp_bias.cpu().numpy()
+             exp_bias = exp_bias.float().cpu().numpy()
         elif isinstance(exp_bias, torch.Tensor):
-             exp_bias = exp_bias.numpy()
+             exp_bias = exp_bias.float().numpy()
 
         # 2. Split if gate_up
         if is_gate_up:
