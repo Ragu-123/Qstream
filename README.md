@@ -1,33 +1,21 @@
 # Qstream
 
-Qstream is a C11 prototype implementation of the `QSF` (Quantized Streaming Format)
-execution path from `immplementationplan.md`, focused on CPU-first, low-memory
-inference building blocks that are more compact than GGUF-style full-tensor loading.
+Qstream now implements a **single-phase integrated CPU pipeline** from the
+`immplementationplan.md` direction: format parsing, memory primitives,
+streaming layer I/O, quantized KV cache, core kernels, and an end-to-end demo
+path in one runnable binary.
 
-## What is implemented
+## Implemented in one phase
 
-- **QSF v1 binary format primitives**
-  - 128-byte fixed header
-  - 32-byte per-layer index entries
-  - CRC32 header integrity validation
-- **Memory foundation**
-  - 64-byte aligned arena allocator for predictable footprint
-- **CPU dispatch foundation**
-  - x86 SSE4.2 / AVX2 / AVX512 feature detection
-  - ARM NEON compile-time detection
-- **Fused scalar quantized kernels (MVP)**
-  - 2-bit and 4-bit fused dequant + matvec (block size 64)
-  - no full dequantized matrix materialization
-- **CLI utility**
-  - create a demo QSF file
-  - inspect QSF metadata + layer index
-  - run deterministic kernel checksum demos
-
-## Why this is compact
-
-Instead of dequantizing full layers into float32 buffers, the kernels dequantize each
-quantized block directly in the hot loop and consume it immediately. This avoids
-allocating large transient matrices and aligns with the plan's low-memory constraint.
+- QSF v1 header + layer index parsing and validation with CRC32.
+- 64-byte aligned arena allocator.
+- CPU feature detection (SSE4.2/AVX2/AVX512F/NEON).
+- Layer streaming runtime (`open`, `index load`, double buffers, per-layer read).
+- Quantized KV cache (2-bit / 4-bit store + dequantized retrieval).
+- Fused dequant + matvec scalar kernels (2-bit and 4-bit, block size 64).
+- Transformer utility kernels: RMSNorm, SiLU, vec add/mul/scale,
+  top-k filtering, temperature softmax, argmax sampler.
+- End-to-end `single-phase-demo` command wiring all components together.
 
 ## Build
 
@@ -37,28 +25,10 @@ make
 
 ## Usage
 
-Create demo file:
-
 ```bash
 ./qstream demo-create demo.qsf
-```
-
-Inspect file:
-
-```bash
 ./qstream inspect demo.qsf
+./qstream single-phase-demo demo.qsf
 ```
 
-Run kernel demos:
-
-```bash
-./qstream matvec-demo 2
-./qstream matvec-demo 4
-```
-
-## Next planned increments
-
-- SIMD kernels (AVX2/AVX512/NEON)
-- mmap/pread double-buffered streaming
-- real converter from HuggingFace safetensors into `.qsf`
-- transformer layer execution loop with KV cache quantization
+The last command exercises all major subsystems in one execution path.

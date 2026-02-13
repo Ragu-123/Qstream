@@ -1,6 +1,6 @@
 CC ?= cc
-CFLAGS ?= -O3 -std=c11 -Wall -Wextra -Werror -pedantic
-LDFLAGS ?=
+CFLAGS ?= -O3 -std=c11 -D_XOPEN_SOURCE=700 -Wall -Wextra -Werror -pedantic
+LDFLAGS ?= -lm
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:.c=.o)

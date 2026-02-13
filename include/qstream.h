@@ -80,6 +80,33 @@ typedef struct {
   int has_neon;
 } qs_cpu_features_t;
 
+typedef struct {
+  int fd;
+  qsf_header_t header;
+  qsf_layer_index_entry_t *index_entries;
+} qs_model_t;
+
+typedef struct {
+  const qs_model_t *model;
+  uint8_t *buffers[2];
+  size_t capacities[2];
+  int active;
+  uint32_t loaded_layer;
+  size_t loaded_size;
+} qs_layer_stream_t;
+
+typedef struct {
+  uint8_t *k_data;
+  uint8_t *v_data;
+  float *k_scales;
+  float *v_scales;
+  uint32_t layers;
+  uint32_t heads;
+  uint32_t head_dim;
+  uint32_t window;
+  uint8_t bits;
+} qs_kv_cache_t;
+
 uint32_t qs_crc32(const void *data, size_t len);
 int qsf_read_header(const char *path, qsf_header_t *out);
 int qsf_validate_header(const qsf_header_t *header);
@@ -93,6 +120,20 @@ void *qs_arena_alloc(qs_arena_t *arena, size_t size, size_t alignment);
 void qs_arena_reset(qs_arena_t *arena);
 
 qs_cpu_features_t qs_detect_cpu_features(void);
+
+int qs_model_open(const char *path, qs_model_t *model);
+void qs_model_close(qs_model_t *model);
+int qs_stream_init(const qs_model_t *model, qs_layer_stream_t *stream);
+void qs_stream_destroy(qs_layer_stream_t *stream);
+int qs_stream_load_layer(qs_layer_stream_t *stream, uint32_t layer);
+
+int qs_kv_cache_init(qs_kv_cache_t *cache, uint32_t layers, uint32_t heads,
+                     uint32_t head_dim, uint32_t window, uint8_t bits);
+void qs_kv_cache_destroy(qs_kv_cache_t *cache);
+int qs_kv_store(qs_kv_cache_t *cache, uint32_t layer, uint32_t head,
+                uint32_t position, const float *key, const float *value);
+int qs_kv_load_key(const qs_kv_cache_t *cache, uint32_t layer, uint32_t head,
+                   uint32_t position, float *out_key);
 
 void qs_fused_matvec_4bit_scalar(const uint8_t *restrict packed,
                                  const float *restrict scales,
@@ -109,5 +150,16 @@ void qs_fused_matvec_2bit_scalar(const uint8_t *restrict packed,
                                  float *restrict output,
                                  uint32_t rows,
                                  uint32_t cols);
+
+void qs_vec_add(const float *a, const float *b, float *out, uint32_t size);
+void qs_vec_mul(const float *a, const float *b, float *out, uint32_t size);
+void qs_vec_scale(float *x, float scale, uint32_t size);
+void qs_rms_norm(const float *input, const float *weight, float *output,
+                 uint32_t dim, float epsilon);
+void qs_silu_inplace(float *x, uint32_t size);
+void qs_softmax_temperature(const float *logits, float *probs, uint32_t size,
+                            float temperature);
+int qs_top_k_filter(float *logits, uint32_t size, uint32_t k);
+uint32_t qs_sample_argmax(const float *probs, uint32_t size);
 
 #endif

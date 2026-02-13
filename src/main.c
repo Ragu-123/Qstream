@@ -8,7 +8,7 @@ static void usage(void) {
   puts("qstream commands:");
   puts("  qstream inspect <file.qsf>");
   puts("  qstream demo-create <file.qsf>");
-  puts("  qstream matvec-demo <2|4>");
+  puts("  qstream single-phase-demo <file.qsf>");
 }
 
 static int cmd_inspect(const char *path) {
@@ -53,7 +53,7 @@ static int cmd_demo_create(const char *path) {
   h.num_heads = 8;
   h.num_kv_heads = 8;
   h.vocab_size = 32000;
-  h.max_seq_len = 1024;
+  h.max_seq_len = 512;
   h.intermediate_dim = 1024;
   h.head_dim = 32;
   h.default_quant = QSF_QUANT_2BIT_ASYM;
@@ -70,27 +70,21 @@ static int cmd_demo_create(const char *path) {
 
   qsf_layer_index_entry_t idx[2];
   memset(idx, 0, sizeof(idx));
-  idx[0].layer_offset = h.final_offset + 1024;
-  idx[0].compressed_size = 2048;
-  idx[0].decompressed_size = 4096;
-  idx[0].quant_type = QSF_QUANT_2BIT_ASYM;
-  idx[0].compression_type = 1;
-  idx[0].num_tensors = 9;
-  idx[0].crc32 = 0;
-  idx[0].importance = 0.82f;
-
-  idx[1] = idx[0];
-  idx[1].layer_offset += 4096;
-  idx[1].importance = 0.78f;
+  for (uint32_t i = 0; i < 2; ++i) {
+    idx[i].layer_offset = h.final_offset + 1024u + 4096u * i;
+    idx[i].compressed_size = 2048;
+    idx[i].decompressed_size = 4096;
+    idx[i].quant_type = QSF_QUANT_2BIT_ASYM;
+    idx[i].compression_type = 0;
+    idx[i].num_tensors = 9;
+    idx[i].importance = 0.8f - 0.02f * (float)i;
+  }
 
   FILE *f = fopen(path, "wb");
   if (!f) {
     return 1;
   }
 
-  fseek(f, 0, SEEK_END);
-  long before = ftell(f);
-  (void)before;
   h.header_crc32 = 0;
   h.header_crc32 = qs_crc32(&h, 96);
 
@@ -112,31 +106,65 @@ static int cmd_demo_create(const char *path) {
   return 0;
 }
 
-static int cmd_matvec_demo(int bits) {
-  const uint32_t rows = 4;
-  const uint32_t cols = 64;
-  float input[rows * cols];
-  for (uint32_t i = 0; i < rows * cols; ++i) {
-    input[i] = (float)(i % 17) / 17.0f;
-  }
-  float out[rows];
-  float scales[4] = {0.1f, 0.2f, 0.1f, 0.15f};
-  float mins[4] = {-0.5f, -0.4f, -0.3f, -0.2f};
+static int cmd_single_phase_demo(const char *path) {
+  qs_cpu_features_t f = qs_detect_cpu_features();
+  printf("cpu features: sse4.2=%d avx2=%d avx512f=%d neon=%d\n", f.has_sse42,
+         f.has_avx2, f.has_avx512f, f.has_neon);
 
-  if (bits == 4) {
-    uint8_t packed[rows * cols / 2u];
-    for (size_t i = 0; i < sizeof(packed); ++i) packed[i] = (uint8_t)(i * 13u);
-    qs_fused_matvec_4bit_scalar(packed, scales, mins, input, out, rows, cols);
-  } else {
-    uint8_t packed[rows * cols / 4u];
-    for (size_t i = 0; i < sizeof(packed); ++i) packed[i] = (uint8_t)(i * 7u);
-    qs_fused_matvec_2bit_scalar(packed, scales, mins, input, out, rows, cols);
+  qs_model_t model;
+  if (qs_model_open(path, &model) != 0) {
+    fprintf(stderr, "model open failed\n");
+    return 1;
   }
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < rows; ++i) {
-    sum += out[i];
+
+  qs_layer_stream_t stream;
+  if (qs_stream_init(&model, &stream) != 0) {
+    qs_model_close(&model);
+    return 2;
   }
-  printf("matvec-%dbit checksum=%f\n", bits, sum);
+  for (uint32_t i = 0; i < model.header.num_layers; ++i) {
+    if (qs_stream_load_layer(&stream, i) != 0) {
+      qs_stream_destroy(&stream);
+      qs_model_close(&model);
+      return 3;
+    }
+  }
+
+  qs_kv_cache_t kv;
+  if (qs_kv_cache_init(&kv, model.header.num_layers, model.header.num_kv_heads,
+                       model.header.head_dim, 64, 2) != 0) {
+    qs_stream_destroy(&stream);
+    qs_model_close(&model);
+    return 4;
+  }
+
+  float key[32], value[32], loaded[32];
+  for (uint32_t i = 0; i < 32; ++i) {
+    key[i] = ((float)(i % 7) - 3.0f) / 3.0f;
+    value[i] = ((float)(i % 11) - 5.0f) / 5.0f;
+  }
+  qs_kv_store(&kv, 0, 0, 0, key, value);
+  qs_kv_load_key(&kv, 0, 0, 0, loaded);
+
+  float rms_w[32], rms_out[32];
+  for (uint32_t i = 0; i < 32; ++i) rms_w[i] = 1.0f;
+  qs_rms_norm(loaded, rms_w, rms_out, 32, 1e-5f);
+  qs_silu_inplace(rms_out, 32);
+
+  float logits[16], probs[16];
+  for (uint32_t i = 0; i < 16; ++i) logits[i] = rms_out[i];
+  qs_top_k_filter(logits, 16, 5);
+  qs_softmax_temperature(logits, probs, 16, 0.8f);
+  uint32_t token = qs_sample_argmax(probs, 16);
+
+  float checksum = 0.0f;
+  for (uint32_t i = 0; i < 32; ++i) checksum += rms_out[i];
+  printf("single-phase checksum=%f token=%u loaded_layer=%u bytes=%zu\n", checksum,
+         token, stream.loaded_layer, stream.loaded_size);
+
+  qs_kv_cache_destroy(&kv);
+  qs_stream_destroy(&stream);
+  qs_model_close(&model);
   return 0;
 }
 
@@ -152,8 +180,8 @@ int main(int argc, char **argv) {
   if (strcmp(argv[1], "demo-create") == 0 && argc == 3) {
     return cmd_demo_create(argv[2]);
   }
-  if (strcmp(argv[1], "matvec-demo") == 0 && argc == 3) {
-    return cmd_matvec_demo(atoi(argv[2]));
+  if (strcmp(argv[1], "single-phase-demo") == 0 && argc == 3) {
+    return cmd_single_phase_demo(argv[2]);
   }
 
   usage();
