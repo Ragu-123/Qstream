@@ -451,6 +451,40 @@ QSFError qsf_engine_create(QSFEngine* engine, const char* model_path,
     engine->layer_buf_compressed = (uint8_t*)arena_alloc(engine->arena,
                          engine->budget.layer_buf_size, 64, "layer_buf_comp");
 
+    /* MoE buffers (only if model uses MoE) */
+    if (h->num_experts > 1) {
+        uint32_t ne  = h->num_experts;
+        uint32_t nae = h->num_active_experts;
+        if (nae == 0) nae = 2;  /* default top-2 */
+        uint32_t expert_id = h->expert_intermediate_dim;
+        if (expert_id == 0) expert_id = id;  /* fallback to global intermediate_dim */
+
+        engine->router_logits  = (float*)arena_alloc(engine->arena,
+                                   ne * sizeof(float), 64, "moe_router");
+        engine->expert_out     = (float*)arena_alloc(engine->arena,
+                                   hd * sizeof(float), 64, "moe_expert_out");
+        engine->expert_scratch = (float*)arena_alloc(engine->arena,
+                                   expert_id * sizeof(float), 64, "moe_expert_scratch");
+        engine->expert_scratch2 = (float*)arena_alloc(engine->arena,
+                                   expert_id * sizeof(float), 64, "moe_expert_scratch2");
+        engine->expert_indices = (int*)arena_alloc(engine->arena,
+                                   nae * sizeof(int), 64, "moe_expert_idx");
+        engine->expert_weights = (float*)arena_alloc(engine->arena,
+                                   nae * sizeof(float), 64, "moe_expert_wt");
+
+        if (!engine->router_logits || !engine->expert_out ||
+            !engine->expert_indices || !engine->expert_weights) {
+            arena_destroy(engine->arena);
+            qsf_model_free(&engine->model);
+            return QSF_ERR_OUT_OF_MEMORY;
+        }
+
+        if (cfg->verbose >= 1) {
+            fprintf(stderr, "[qstream] MoE: %u experts, top-%u active, "
+                    "expert FFN dim=%u\n", ne, nae, expert_id);
+        }
+    }
+
     if (!engine->activation || !engine->residual || !engine->scratch ||
         !engine->q_buf || !engine->logits || !engine->layer_buf) {
         arena_destroy(engine->arena);
@@ -812,7 +846,139 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
         }
 
         /* ── FFN ─────────────────────────────────────────────────── */
-        if (h->ffn_type == QSF_FFN_GATED) {
+        if (h->ffn_type == QSF_FFN_MOE && h->num_experts > 1) {
+            /* ── Mixture-of-Experts FFN ──────────────────────────── *
+             * MoE replaces the dense FFN with sparse expert routing: *
+             *   1. Router: normed_x → logits[num_experts]           *
+             *   2. Softmax → top-K selection                        *
+             *   3. Per-expert gated FFN, weighted accumulate        *
+             * ─────────────────────────────────────────────────────── */
+            uint32_t num_exp = h->num_experts;
+            uint32_t num_active = h->num_active_experts;
+            if (num_active == 0) num_active = 2;
+            uint32_t eid = h->expert_intermediate_dim;
+            if (eid == 0) eid = id;
+
+            /* Save normed activation (x) — we'll zero x for accumulation
+             * but need the normed value as input to every expert. */
+            memcpy(engine->expert_out, x, hd * sizeof(float));
+
+            /* 1. Router: normed_x → router_logits[num_experts] */
+            tensor_data = find_tensor(layer_data, nt,
+                                       QSF_TENSOR_MOE_ROUTER, &th);
+            if (!tensor_data) {
+                qsf_set_error(QSF_ERR_INVALID_MODEL, "missing MoE router");
+                return QSF_ERR_INVALID_MODEL;
+            }
+            {
+                uint8_t qt = (th.quant_type == QSF_QUANT_USE_DEFAULT)
+                             ? layer_qt : th.quant_type;
+                get_matvec_fn(k, qt)(tensor_data, engine->expert_out,
+                    engine->router_logits, th.rows, th.cols, bs);
+            }
+
+            /* 2. Softmax over router logits */
+            k->softmax(engine->router_logits, engine->router_logits,
+                       (int)num_exp);
+
+            /* 3. Top-K selection (insertion-sort into small array) */
+            for (uint32_t i = 0; i < num_active; i++) {
+                engine->expert_indices[i] = -1;
+                engine->expert_weights[i] = -1e30f;
+            }
+            for (uint32_t e = 0; e < num_exp; e++) {
+                float w = engine->router_logits[e];
+                for (uint32_t i = 0; i < num_active; i++) {
+                    if (w > engine->expert_weights[i]) {
+                        for (uint32_t j = num_active - 1; j > i; j--) {
+                            engine->expert_weights[j] =
+                                engine->expert_weights[j - 1];
+                            engine->expert_indices[j] =
+                                engine->expert_indices[j - 1];
+                        }
+                        engine->expert_weights[i] = w;
+                        engine->expert_indices[i] = (int)e;
+                        break;
+                    }
+                }
+            }
+
+            /* 4. Renormalize top-K weights (Mixtral-style) */
+            if (h->moe_norm_topk) {
+                float wsum = 0.0f;
+                for (uint32_t i = 0; i < num_active; i++)
+                    wsum += engine->expert_weights[i];
+                if (wsum > 0.0f) {
+                    float inv = 1.0f / wsum;
+                    for (uint32_t i = 0; i < num_active; i++)
+                        engine->expert_weights[i] *= inv;
+                }
+            }
+
+            /* 5. Zero output accumulator */
+            memset(x, 0, hd * sizeof(float));
+
+            /* 6. Execute each active expert (gated FFN) */
+            for (uint32_t ai = 0; ai < num_active; ai++) {
+                int eidx = engine->expert_indices[ai];
+                if (eidx < 0) continue;
+                float ew = engine->expert_weights[ai];
+
+                /* Expert gate projection: normed_x → expert_scratch */
+                tensor_data = find_tensor(layer_data, nt,
+                    (QSFTensorType)QSF_MOE_GATE(eidx), &th);
+                if (tensor_data) {
+                    uint8_t qt = (th.quant_type == QSF_QUANT_USE_DEFAULT)
+                                 ? layer_qt : th.quant_type;
+                    get_matvec_fn(k, qt)(tensor_data, engine->expert_out,
+                        engine->expert_scratch, th.rows, th.cols, bs);
+                }
+
+                /* Expert up projection: normed_x → expert_scratch2 */
+                tensor_data = find_tensor(layer_data, nt,
+                    (QSFTensorType)QSF_MOE_UP(eidx), &th);
+                if (tensor_data) {
+                    uint8_t qt = (th.quant_type == QSF_QUANT_USE_DEFAULT)
+                                 ? layer_qt : th.quant_type;
+                    get_matvec_fn(k, qt)(tensor_data, engine->expert_out,
+                        engine->expert_scratch2, th.rows, th.cols, bs);
+                }
+
+                /* Activation on gate (SiLU for Mixtral/LLaMA-family) */
+                if (h->activation == QSF_ACT_SILU) {
+                    k->silu(engine->expert_scratch, (int)eid);
+                } else if (h->activation == QSF_ACT_GELU ||
+                           h->activation == QSF_ACT_GELU_APPROX) {
+                    k->gelu(engine->expert_scratch, (int)eid);
+                } else {
+                    k->relu(engine->expert_scratch, (int)eid);
+                }
+
+                /* gate * up → expert_scratch */
+                k->vec_mul(engine->expert_scratch, engine->expert_scratch2,
+                           engine->expert_scratch, (int)eid);
+
+                /* Expert down projection: expert_scratch → scratch
+                 * (scratch is id-sized, guaranteed >= hd; not used
+                 *  by dense FFN path since we're in MoE branch) */
+                tensor_data = find_tensor(layer_data, nt,
+                    (QSFTensorType)QSF_MOE_DOWN(eidx), &th);
+                if (tensor_data) {
+                    uint8_t qt = (th.quant_type == QSF_QUANT_USE_DEFAULT)
+                                 ? layer_qt : th.quant_type;
+                    get_matvec_fn(k, qt)(tensor_data, engine->expert_scratch,
+                        engine->scratch, th.rows, th.cols, bs);
+                }
+
+                /* Weighted accumulate: x += weight * expert_output */
+                for (uint32_t d = 0; d < hd; d++) {
+                    x[d] += ew * engine->scratch[d];
+                }
+            }
+        }
+
+        /* ─── Dense FFN paths ────────────────────────────────────── */
+        else if (h->ffn_type == QSF_FFN_GATED) {
             /* Gated FFN: gate_proj(x) * silu(up_proj(x)) → down_proj */
 
             /* Gate projection */

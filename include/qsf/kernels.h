@@ -184,6 +184,10 @@ void qsf_matvec_4bit_avx2(const void* QSF_RESTRICT w,
                            const float* QSF_RESTRICT in,
                            float* QSF_RESTRICT out,
                            int rows, int cols, int bs);
+void qsf_matvec_4bit_sym_avx2(const void* QSF_RESTRICT w,
+                                const float* QSF_RESTRICT in,
+                                float* QSF_RESTRICT out,
+                                int rows, int cols, int bs);
 void qsf_vec_add_avx2(const float* QSF_RESTRICT a,
                        const float* QSF_RESTRICT b,
                        float* QSF_RESTRICT o, int n);

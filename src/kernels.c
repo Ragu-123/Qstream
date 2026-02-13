@@ -28,6 +28,7 @@ void qsf_kernels_init(QSFKernelTable* kt, const QSFPlatformInfo* platform) {
     if (platform->has_avx2 && platform->has_fma) {
         kt->matvec_2bit  = qsf_matvec_2bit_avx2;
         kt->matvec_4bit  = qsf_matvec_4bit_avx2;
+        kt->matvec_4bit_sym = qsf_matvec_4bit_sym_avx2;
         kt->vec_add      = qsf_vec_add_avx2;
         kt->vec_mul      = qsf_vec_mul_avx2;
         kt->silu         = qsf_silu_avx2;

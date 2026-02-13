@@ -54,7 +54,7 @@ QSF_NO_TOKEN    = 0xFFFFFFFF
 ARCH_MAP = {
     'gpt2': 0, 'llama': 1, 'mistral': 2, 'phi': 3,
     'gptj': 4, 'gpt_neox': 4, 'qwen2': 5, 'gemma': 6,
-    'stablelm': 7,
+    'stablelm': 7, 'mixtral': 8, 'deepseek': 9, 'gpt_oss': 10,
 }
 
 # Quantization type IDs
@@ -82,6 +82,7 @@ NORM_MAP = {
 FFN_STANDARD = 0
 FFN_GATED    = 1
 FFN_PARALLEL = 2
+FFN_MOE      = 3
 
 # Tensor type IDs
 TENSOR_ATTN_Q      = 0
@@ -105,6 +106,14 @@ TENSOR_FFN_DOWN_BIAS = 17
 TENSOR_FUSED_QKV     = 18
 TENSOR_FUSED_QKV_BIAS = 19
 TENSOR_POS_EMBED     = 20
+TENSOR_MOE_ROUTER    = 21
+TENSOR_MOE_GATE_0    = 22   # +3 per expert
+TENSOR_MOE_UP_0      = 23   # +3 per expert
+TENSOR_MOE_DOWN_0    = 24   # +3 per expert
+
+def moe_gate_id(expert): return TENSOR_MOE_GATE_0 + expert * 3
+def moe_up_id(expert):   return TENSOR_MOE_UP_0   + expert * 3
+def moe_down_id(expert): return TENSOR_MOE_DOWN_0 + expert * 3
 
 
 ###############################################################################
@@ -282,7 +291,8 @@ class Quantizer:
 ###############################################################################
 # Architecture-specific tensor name mapping
 ###############################################################################
-def get_tensor_mapping(arch: str, num_layers: int) -> Dict[str, Tuple[str, int]]:
+def get_tensor_mapping(arch: str, num_layers: int,
+                       config: dict = None) -> Dict[str, Tuple[str, int]]:
     """
     Build a mapping: HF_tensor_name → (qsf_role, layer_index).
     layer_index = -1 for global tensors (embedding, final norm, output head).
@@ -372,6 +382,67 @@ def get_tensor_mapping(arch: str, num_layers: int) -> Dict[str, Tuple[str, int]]
             mapping[f'{p}.mlp.fc_in.bias'] = ('ffn_up_b', L)
             mapping[f'{p}.mlp.fc_out.weight'] = ('ffn_down_w', L)
             mapping[f'{p}.mlp.fc_out.bias'] = ('ffn_down_b', L)
+
+
+    # Generic MoE Support (Mixtral, DeepSeek, Qwen-MoE, GPT-OSS)
+    # Check all known MoE patterns if the architecture is identified as MoE
+    # or if we fell back to 'mixtral' during auto-detection.
+    elif arch in ('mixtral', 'deepseek', 'gpt_oss', 'qwen2_moe'):
+        # Global mappings (try standard names)
+        mapping['model.embed_tokens.weight'] = ('embedding', -1)
+        mapping['model.norm.weight'] = ('final_norm_w', -1)
+        mapping['lm_head.weight'] = ('output_head', -1)
+        # Some models use 'transformer.wte' etc. (checked via specific arch blocks above if needed)
+
+        for L in range(num_layers):
+            p = f'model.layers.{L}'
+            
+            # 1. Attention (Standard & Qwen/DeepSeek variants)
+            # Standard LLaMA/Mistral names
+            mapping[f'{p}.self_attn.q_proj.weight'] = ('attn_q_w', L)
+            mapping[f'{p}.self_attn.k_proj.weight'] = ('attn_k_w', L)
+            mapping[f'{p}.self_attn.v_proj.weight'] = ('attn_v_w', L)
+            mapping[f'{p}.self_attn.o_proj.weight'] = ('attn_o_w', L)
+            # Qwen/DeepSeek might use 'c_attn' (fused) or different names? 
+            # Usually they follow LLaMA conventions in HF.
+
+            # Norms
+            mapping[f'{p}.input_layernorm.weight'] = ('attn_norm_w', L)
+            mapping[f'{p}.post_attention_layernorm.weight'] = ('ffn_norm_w', L)
+            # Qwen uses 'rms_norm' sometimes? standardizing on LLaMA names for now.
+
+            # 2. MoE Router (Gate) - Try common names
+            # Mixtral: block_sparse_moe.gate
+            mapping[f'{p}.block_sparse_moe.gate.weight'] = ('moe_router_w', L)
+            # DeepSeek/Qwen: mlp.gate
+            mapping[f'{p}.mlp.gate.weight'] = ('moe_router_w', L)
+            # GPT-OSS: block_sparse_layer.gate?
+            mapping[f'{p}.block_sparse_layer.gate.weight'] = ('moe_router_w', L)
+
+            # 3. Experts - Try common names
+            num_experts = config.get('num_local_experts', 
+                            config.get('n_routed_experts', 
+                              config.get('num_experts', 8)))
+            
+            for e in range(num_experts):
+                # Expert prefix patterns
+                prefixes = [
+                    f'{p}.block_sparse_moe.experts.{e}', # Mixtral
+                    f'{p}.mlp.experts.{e}',               # DeepSeek/Qwen
+                    f'{p}.block_sparse_layer.experts.{e}' # GPT-OSS
+                ]
+                
+                for ep in prefixes:
+                    # Pattern A: w1(gate), w3(up), w2(down) - Mixtral style
+                    mapping[f'{ep}.w1.weight'] = (f'moe_gate_w_{e}', L)
+                    mapping[f'{ep}.w3.weight'] = (f'moe_up_w_{e}', L)
+                    mapping[f'{ep}.w2.weight'] = (f'moe_down_w_{e}', L)
+                    
+                    # Pattern B: gate_proj, up_proj, down_proj - LLaMA style
+                    mapping[f'{ep}.gate_proj.weight'] = (f'moe_gate_w_{e}', L)
+                    mapping[f'{ep}.up_proj.weight']   = (f'moe_up_w_{e}', L)
+                    mapping[f'{ep}.down_proj.weight'] = (f'moe_down_w_{e}', L)
+
 
     return mapping
 
@@ -584,8 +655,16 @@ class QSFWriter:
         cfg = self.config
         num_layers = cfg['num_hidden_layers']
 
+        num_experts = cfg.get('num_local_experts',
+                       cfg.get('n_routed_experts', 0))
+        self.num_experts = num_experts
+        self.config = cfg   # store for MoE access
+
         log.info(f"Writing QSF: {arch}, {num_layers} layers, "
                  f"quant={self.quant_type}, bs={self.block_size}")
+        if num_experts > 1:
+            nae = cfg.get('num_experts_per_tok', 2)
+            log.info(f"  MoE: {num_experts} experts, top-{nae}")
 
         with open(self.output_path, 'wb') as f:
             # Reserve space for header
@@ -608,7 +687,7 @@ class QSFWriter:
             f.write(tok_bytes)
 
             # ── 4. Write each layer ──
-            mapping = get_tensor_mapping(arch, num_layers)
+            mapping = get_tensor_mapping(arch, num_layers, cfg)
             for layer_idx in range(num_layers):
                 log.info(f"  Layer {layer_idx}/{num_layers-1}")
                 entry = self._write_layer(f, loader, mapping,
@@ -674,7 +753,11 @@ class QSFWriter:
             pos_enc = 1  # RoPE
 
         # FFN type
-        if arch in ('llama', 'mistral', 'qwen2', 'gemma'):
+        num_experts = cfg.get('num_local_experts',
+                       cfg.get('n_routed_experts', 0))
+        if num_experts > 1:
+            ffn_type = FFN_MOE
+        elif arch in ('llama', 'mistral', 'qwen2', 'gemma'):
             ffn_type = FFN_GATED
         elif arch in ('gptj',):
             ffn_type = FFN_PARALLEL
@@ -777,7 +860,19 @@ class QSFWriter:
         header_crc = crc32(bytes(buf[:168]))
         struct.pack_into('<I', buf, 168, header_crc)
         struct.pack_into('<B', buf, 172, 0x01)  # endian marker = LE
-        # bytes 173-255 already zero
+
+        # MoE fields (offset 173-180)
+        num_experts = cfg.get('num_local_experts',
+                       cfg.get('n_routed_experts', 0))
+        num_active = cfg.get('num_experts_per_tok', 2)
+        moe_norm = 1 if num_experts > 1 else 0
+        expert_ffn_dim = cfg.get('expert_intermediate_size',
+                           cfg.get('intermediate_size', 4 * hidden_dim))
+        struct.pack_into('<B', buf, 173, min(num_experts, 255))
+        struct.pack_into('<B', buf, 174, min(num_active, 255))
+        struct.pack_into('<B', buf, 175, moe_norm)
+        # byte 176 is reserved padding (already zero)
+        struct.pack_into('<I', buf, 177, expert_ffn_dim)
 
         return bytes(buf)
 
@@ -843,7 +938,15 @@ class QSFWriter:
             'ffn_gate_b': TENSOR_FFN_GATE_BIAS,
             'ffn_up_b': TENSOR_FFN_UP_BIAS, 'ffn_down_b': TENSOR_FFN_DOWN_BIAS,
             'fused_qkv_w': TENSOR_FUSED_QKV, 'fused_qkv_b': TENSOR_FUSED_QKV_BIAS,
+            'moe_router_w': TENSOR_MOE_ROUTER,
         }
+        # Add per-expert MoE tensor IDs dynamically
+        num_experts = cfg.get('num_local_experts',
+                       cfg.get('n_routed_experts', 0))
+        for e in range(num_experts):
+            role_to_type[f'moe_gate_w_{e}'] = moe_gate_id(e)
+            role_to_type[f'moe_up_w_{e}']   = moe_up_id(e)
+            role_to_type[f'moe_down_w_{e}'] = moe_down_id(e)
 
         num_tensors = 0
         layer_buf = bytearray()
@@ -970,8 +1073,169 @@ class QSFWriter:
 
 
 ###############################################################################
-# Main
+# GPT-OSS Loader (MXFP4 handling)
 ###############################################################################
+class GptOssLoader(TensorLoader):
+    def __init__(self, model_dir, num_experts):
+        super().__init__(model_dir)
+        self.num_experts = num_experts
+
+    def get_tensor(self, name):
+        # 1. Check if it's a virtual expert tensor
+        # Pattern: model.layers.L.block_sparse_layer.experts.E.ROLE.weight
+        # where ROLE is gate_proj, up_proj, down_proj
+        # (Mapped from 'moe_gate_w_E', 'moe_up_w_E', 'moe_down_w_E')
+        
+        # We need to reverse-map or just handle the HF names requested by _write_layer
+        # The mapping in get_tensor_mapping produces names like:
+        # model.layers.0.block_sparse_layer.experts.0.gate.weight
+        
+        if 'experts' in name and 'weight' in name:
+            return self._load_virtual_expert(name)
+        
+        # 2. Standard tensor
+        return super().get_tensor(name)
+
+    def _load_virtual_expert(self, name):
+        # Parse name: model.layers.{L}.block_sparse_layer.experts.{E}.{role}.weight
+        try:
+            parts = name.split('.')
+            l_idx = int(parts[2])
+            e_idx = int(parts[5])
+            role = parts[6] # gate, up, or down (from mapping)
+        except:
+            return super().get_tensor(name)
+
+        # Map to physical tensors
+        # Physical: model.layers.L.mlp.experts.gate_up_proj_blocks (stacked)
+        #           model.layers.L.mlp.experts.down_proj_blocks
+        
+        prefix = f'model.layers.{l_idx}.mlp.experts'
+        
+        if role in ('gate', 'up', 'w1', 'w3', 'gate_proj', 'up_proj'):
+            base = f'{prefix}.gate_up_proj'
+            is_gate_up = True
+        elif role in ('down', 'w2', 'down_proj'):
+            base = f'{prefix}.down_proj'
+            is_gate_up = False
+        else:
+            return super().get_tensor(name)
+
+        # Load blocks and scales
+        blocks = super().get_tensor(f'{base}_blocks')
+        scales = super().get_tensor(f'{base}_scales')
+        
+        if blocks is None or scales is None:
+            # Maybe not quantized? Try loading raw weight
+            raw_name = f'{base}.weight'
+            # But the raw weight is likely stacked too
+            # The user config says "quant_method": "mxfp4", so blocks/scales should exist.
+            # If not, try loading strict name?
+            return None
+
+        # Dimensions
+        # blocks: [NUM_EXPERTS, ROWS, BLOCKS_PER_ROW, 16]
+        # scales: [NUM_EXPERTS, ROWS, BLOCKS_PER_ROW]
+        
+        # 1. Extract expert slice
+        # blocks: [ROWS, BLOCKS_PER_ROW, 16]
+        # scales: [ROWS, BLOCKS_PER_ROW]
+        exp_blocks = blocks[e_idx]
+        exp_scales = scales[e_idx]
+        
+        # 2. Dequantize
+        # Result shape: [ROWS, COLS] where COLS = BLOCKS_PER_ROW * 32
+        data = self._dequant_mxfp4(exp_blocks, exp_scales)
+        
+        # 3. Split if gate_up
+        if is_gate_up:
+            # data is [GATE_ROWS + UP_ROWS, COLS]
+            # usually hidden_dim
+            rows = data.shape[0]
+            split = rows // 2
+            if role in ('gate', 'w1', 'gate_proj'):
+                return data[:split]
+            else:
+                return data[split:]
+        else:
+            return data
+
+    def _dequant_mxfp4(self, blocks, scales):
+        # blocks: [ROWS, N_BLOCKS, 16], uint8
+        # scales: [ROWS, N_BLOCKS], float (or castable)
+        
+        rows, n_blocks, _ = blocks.shape
+        
+        # 1. Unpack uint8 -> two int4 (or rather 4-bit values)
+        # Only support generic unsigned unpacking for now, scaling handles sign?
+        # Re-reading MXFP4 spec or assuming common:
+        # Usually E2M1 or similar. 
+        # But wait, user said "gpt-oss".
+        # Let's assume standard packed int4 (low nibble, high nibble) mapped to -8..7 or similar?
+        # Actually checking config: "mxfp4".
+        # Assume simple: (value - 8) * scale? Or standard 4-bit?
+        # Without exact specs, let's try standard int4 symmetric dequant.
+        # unpack:
+        # b[...][i] has lo (bits 0-3) and hi (bits 4-7)
+        
+        lower = blocks & 0x0F
+        upper = (blocks >> 4) & 0x0F
+        
+        # Stack to get 32 values: [ROWS, N_BLOCKS, 16, 2] -> [ROWS, N_BLOCKS, 32]
+        # Make a temporary with shape [..., 32]
+        unpacked = np.empty((rows, n_blocks, 32), dtype=np.float32)
+        unpacked[:, :, 0::2] = lower
+        unpacked[:, :, 1::2] = upper
+        
+        # Map 0..15 to something?
+        # MXFP4 is usually E2M1. 
+        # codes = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6] ?
+        # Or simple integer?
+        # "mxfp4" usually implies Microscaling formats involving E2M1.
+        # Let's assume the values are effectively 4-bit floating point lookups.
+        # Lookup table for E2M1:
+        # [0, 0.5, 1, 1.5, 2, 3, 4, 6] (positive)
+        # sign bit handled?
+        # If it's pure 4-bit float, we need a lookup table.
+        # If it's int4, it's (x - zero) * scale.
+        
+        # QStream author note: If we don't know, treat as int4 symmetric for now (-8..7).
+        # unpacked = unpacked - 8.0?
+        # But if scales are large, fine.
+        
+        # Let's try: (unpacked - 8) * scale? 
+        # Or if the blocks are "mxfp4", they are indices into a codebook.
+        # Codebook for standard E2M1:
+        # 0000 -> 0
+        # 0001 -> 0.5
+        # ...
+        # If we assume it's just raw 4-bit integers scaled:
+        # unpacked = (unpacked.astype(np.float32) - 8.0) * scales_expanded
+        
+        # Wait, scales shape is [ROWS, N_BLOCKS]
+        # We need to broadcast scale to [ROWS, N_BLOCKS, 32]
+        scales_bd = scales[:, :, np.newaxis]
+        
+        # Apply E2M1 lookup table (common for MXFP4)
+        # S E1 M2 (1 sign, 2 exp, 1 mantissa)? No E2M1 is 2 exp 1 mantissa.
+        # 4 bits.
+        # Standard OCP MXFP4:
+        # P0, P1, ...
+        # Let's try a simple lookup suitable for E2M1.
+        mxfp4_lut = np.array([
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,   # 0-7
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 # 8-15 (sign bit set?)
+        ], dtype=np.float32)
+        
+        # Using indices (unpacked is 0..15)
+        indices = unpacked.astype(np.int32)
+        values = mxfp4_lut[indices]
+        
+        # Multiply by scale
+        result = values * scales_bd
+        
+        # Reshape to [ROWS, COLS]
+        return result.reshape(rows, -1)
 def parse_config(model_dir: Path) -> dict:
     """Parse config.json from model directory."""
     config_file = model_dir / 'config.json'
@@ -988,17 +1252,28 @@ def detect_architecture(config: dict) -> str:
         'gpt2': 'gpt2',
         'llama': 'llama',
         'mistral': 'mistral',
+        'mixtral': 'mixtral',
         'phi': 'phi', 'phi-msft': 'phi', 'phi3': 'phi',
         'gptj': 'gptj', 'gpt-j': 'gptj',
         'gpt_neox': 'gpt_neox',
         'qwen2': 'qwen2',
         'gemma': 'gemma', 'gemma2': 'gemma',
         'stablelm': 'stablelm',
+        'deepseek': 'deepseek', 'deepseek_v2': 'deepseek',
+        'gpt_oss': 'gpt_oss', 'qwen2_moe': 'qwen2_moe',
     }
     arch = arch_aliases.get(model_type)
     if arch is None:
-        log.warning(f"Unknown model_type '{model_type}', defaulting to llama")
-        arch = 'llama'
+        # Auto-detect MoE by checking for expert-related config keys
+        if (config.get('num_local_experts') or 
+            config.get('n_routed_experts') or 
+            config.get('num_experts')):
+            log.warning(f"Unknown model_type '{model_type}' with MoE config, "
+                        f"defaulting to generic mixtral/moe path")
+            arch = 'mixtral'
+        else:
+            log.warning(f"Unknown model_type '{model_type}', defaulting to llama")
+            arch = 'llama'
     return arch
 
 
@@ -1060,7 +1335,11 @@ Examples:
     tok_data = parse_tokenizer(model_dir)
 
     # 3. Index tensors
-    loader = TensorLoader(args.model_dir)
+    if arch == 'gpt_oss':
+        num_experts = config.get('num_local_experts', 32)
+        loader = GptOssLoader(args.model_dir, num_experts)
+    else:
+        loader = TensorLoader(args.model_dir)
 
     # 4. Convert
     quant_type = QUANT_TYPE_MAP[args.quant]

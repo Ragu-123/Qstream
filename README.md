@@ -85,4 +85,6 @@ The primary interface is the `qstream` command-line tool.
 *   `tests/` - Unit tests.
 *   `CMakeLists.txt` - Build configuration.
 
+## License
 
+[Insert License Here]

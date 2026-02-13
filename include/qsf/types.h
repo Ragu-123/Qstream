@@ -33,6 +33,9 @@ typedef enum {
     QSF_ARCH_QWEN       = 5,
     QSF_ARCH_GEMMA      = 6,
     QSF_ARCH_STABLELM   = 7,
+    QSF_ARCH_MIXTRAL    = 8,
+    QSF_ARCH_DEEPSEEK   = 9,
+    QSF_ARCH_GPT_OSS    = 10,
     QSF_ARCH_CUSTOM     = 128,
 } QSFArch;
 
@@ -90,6 +93,7 @@ typedef enum {
     QSF_FFN_STANDARD  = 0,   /* up → act → down */
     QSF_FFN_GATED     = 1,   /* gate ⊙ up → down (LLaMA) */
     QSF_FFN_PARALLEL  = 2,   /* GPT-J parallel attn+FFN */
+    QSF_FFN_MOE       = 3,   /* Mixture-of-Experts sparse FFN */
 } QSFFFNType;
 
 /* ── Attention Type ──────────────────────────────────────────────── */
@@ -131,7 +135,22 @@ typedef enum {
     QSF_TENSOR_FUSED_QKV    = 18,
     QSF_TENSOR_FUSED_QKV_BIAS = 19,
     QSF_TENSOR_POS_EMBED    = 20,
+    /* MoE tensors — IDs encode expert index:
+     *   tensor_type = MOE_GATE + expert_id * 3  (gate of expert N)
+     *   tensor_type = MOE_UP   + expert_id * 3  (up   of expert N)
+     *   tensor_type = MOE_DOWN + expert_id * 3  (down of expert N)
+     * The router is always a single tensor.  */
+    QSF_TENSOR_MOE_ROUTER   = 21,
+    QSF_TENSOR_MOE_GATE_0   = 22,  /* first expert gate — +3 per expert */
+    QSF_TENSOR_MOE_UP_0     = 23,  /* first expert up   — +3 per expert */
+    QSF_TENSOR_MOE_DOWN_0   = 24,  /* first expert down — +3 per expert */
+    /* Expert N: gate = 22+3*N, up = 23+3*N, down = 24+3*N */
 } QSFTensorType;
+
+/* Helper macros for MoE expert tensor IDs */
+#define QSF_MOE_GATE(expert)  (QSF_TENSOR_MOE_GATE_0 + (expert) * 3)
+#define QSF_MOE_UP(expert)    (QSF_TENSOR_MOE_UP_0   + (expert) * 3)
+#define QSF_MOE_DOWN(expert)  (QSF_TENSOR_MOE_DOWN_0 + (expert) * 3)
 
 /* ── Tokenizer Type ──────────────────────────────────────────────── */
 typedef enum {
@@ -205,7 +224,15 @@ typedef struct QSF_PACKED {
     uint64_t total_file_size;       /* 160 */
     uint32_t header_crc32;          /* 168 */
     uint8_t  endian_marker;         /* 172: 0x01 = LE */
-    uint8_t  reserved[83];         /* 173-255 */
+
+    /* MoE configuration (carved from reserved, backward compat:
+     * num_experts==0 means dense, which was the old default) */
+    uint8_t  num_experts;           /* 173: 0/1 = dense, >1 = MoE */
+    uint8_t  num_active_experts;    /* 174: top-K (e.g. 2) */
+    uint8_t  moe_norm_topk;         /* 175: 1 = renormalize router weights */
+    uint8_t  reserved_moe;          /* 176: padding */
+    uint32_t expert_intermediate_dim; /* 177: per-expert FFN dim */
+    uint8_t  reserved[75];          /* 181-255 */
 } QSFHeader;
 
 /* Layer index entry — 48 bytes */

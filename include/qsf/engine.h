@@ -101,6 +101,14 @@ typedef struct {
     /* Position embedding table (GPT-2 only) */
     float*   pos_embed;        /* [max_seq * hidden_dim] or NULL */
 
+    /* MoE buffers (only allocated if num_experts > 1) */
+    float*   router_logits;    /* [num_experts] router output */
+    float*   expert_out;       /* [hidden_dim] single expert output */
+    float*   expert_scratch;   /* [expert_intermediate_dim] expert scratch */
+    float*   expert_scratch2;  /* [expert_intermediate_dim] expert scratch2 */
+    int*     expert_indices;   /* [num_active_experts] selected expert IDs */
+    float*   expert_weights;   /* [num_active_experts] normalized router weights */
+
     /* Output head */
     void*    output_head;      /* quantized weight or NULL if tied */
     int      output_head_quant;

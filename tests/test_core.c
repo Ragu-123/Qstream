@@ -592,6 +592,162 @@ static void test_repeat_penalty_noop(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  Matvec Correctness Tests (Scalar vs Dispatch / AVX2)
+ * ═══════════════════════════════════════════════════════════════════ */
+static void test_matvec_4bit_correctness(void) {
+    TEST(matvec_4bit_vs_scalar);
+
+    /* 4 rows × 64 cols, block_size=64 → 1 block per row */
+    const int rows = 4, cols = 64, bs = 64;
+    float weights_fp32[4][64];
+    float input[64];
+    float out_scalar[4], out_dispatch[4];
+
+    /* Deterministic test data */
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+            weights_fp32[r][c] = (float)(r * cols + c) / 256.0f - 0.5f;
+    for (int c = 0; c < cols; c++)
+        input[c] = (float)c / 64.0f - 0.5f;
+
+    /* Quantize each row into packed 4-bit blocks */
+    size_t block_sz = qsf_quant_block_size(QSF_QUANT_4BIT_ASYM, bs);
+    size_t total_packed = rows * block_sz;
+    uint8_t* packed = (uint8_t*)malloc(total_packed);
+    ASSERT_TRUE(packed != NULL);
+    for (int r = 0; r < rows; r++) {
+        qsf_quant_block_4bit(weights_fp32[r], packed + r * block_sz, bs);
+    }
+
+    /* Run scalar reference */
+    qsf_matvec_4bit_scalar(packed, input, out_scalar, rows, cols, bs);
+
+    /* Run dispatched (AVX2 on x86, scalar elsewhere) */
+    QSFPlatformInfo pi;
+    qsf_detect_platform(&pi);
+    QSFKernelTable kt;
+    qsf_kernels_init(&kt, &pi);
+    kt.matvec_4bit(packed, input, out_dispatch, rows, cols, bs);
+
+    /* AVX2 must produce results within float tolerance of scalar */
+    for (int r = 0; r < rows; r++) {
+        ASSERT_NEAR(out_dispatch[r], out_scalar[r], 1e-3f);
+    }
+
+    free(packed);
+    PASS();
+}
+
+static void test_matvec_2bit_correctness(void) {
+    TEST(matvec_2bit_vs_scalar);
+
+    const int rows = 4, cols = 64, bs = 64;
+    float weights_fp32[4][64];
+    float input[64];
+    float out_scalar[4], out_dispatch[4];
+
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+            weights_fp32[r][c] = (float)(r * cols + c) / 256.0f - 0.5f;
+    for (int c = 0; c < cols; c++)
+        input[c] = (float)c / 64.0f - 0.5f;
+
+    size_t block_sz = qsf_quant_block_size(QSF_QUANT_2BIT_ASYM, bs);
+    size_t total_packed = rows * block_sz;
+    uint8_t* packed = (uint8_t*)malloc(total_packed);
+    ASSERT_TRUE(packed != NULL);
+    for (int r = 0; r < rows; r++) {
+        qsf_quant_block_2bit(weights_fp32[r], packed + r * block_sz, bs);
+    }
+
+    qsf_matvec_2bit_scalar(packed, input, out_scalar, rows, cols, bs);
+
+    QSFPlatformInfo pi;
+    qsf_detect_platform(&pi);
+    QSFKernelTable kt;
+    qsf_kernels_init(&kt, &pi);
+    kt.matvec_2bit(packed, input, out_dispatch, rows, cols, bs);
+
+    for (int r = 0; r < rows; r++) {
+        ASSERT_NEAR(out_dispatch[r], out_scalar[r], 1e-3f);
+    }
+
+    free(packed);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  MoE Logic Tests
+ * ═══════════════════════════════════════════════════════════════════ */
+static void test_header_moe_fields(void) {
+    TEST(header_moe_fields);
+    
+    QSFHeader h;
+    memset(&h, 0, sizeof(h));
+    
+    /* Set MoE fields */
+    h.num_experts = 8;
+    h.num_active_experts = 2;
+    h.moe_norm_topk = 1;
+    h.expert_intermediate_dim = 14336;
+    
+    /* Verify size is still 256 */
+    ASSERT_EQ_INT((int)sizeof(h), 256);
+    
+    /* Verify values persist */
+    ASSERT_EQ_INT((int)h.num_experts, 8);
+    ASSERT_EQ_INT((int)h.num_active_experts, 2);
+    ASSERT_EQ_INT((int)h.expert_intermediate_dim, 14336);
+    
+    /* Verify tensor type macros */
+    /* Gate 0 = 22, Gate 1 = 25... */
+    ASSERT_EQ_INT(QSF_MOE_GATE(0), 22);
+    ASSERT_EQ_INT(QSF_MOE_GATE(1), 25);
+    ASSERT_EQ_INT(QSF_MOE_UP(0), 23);
+    ASSERT_EQ_INT(QSF_MOE_DOWN(0), 24);
+    
+    PASS();
+}
+
+static void test_moe_router_logic(void) {
+    TEST(moe_router_logic);
+    
+    /* Simulate router output for 4 experts */
+    float logits[4] = { 0.1f, 0.8f, 0.4f, 0.6f };
+    /* Expected top-2: index 1 (0.8) and index 3 (0.6) */
+    
+    int indices[2] = { -1, -1 };
+    float weights[2] = { -1e30f, -1e30f };
+    int num_active = 2;
+    int num_exp = 4;
+    
+    /* Run insertion sort logic exactly as in engine.c */
+    for (int e = 0; e < num_exp; e++) {
+        float w = logits[e];
+        for (int i = 0; i < num_active; i++) {
+            if (w > weights[i]) {
+                for (int j = num_active - 1; j > i; j--) {
+                    weights[j] = weights[j - 1];
+                    indices[j] = indices[j - 1];
+                }
+                weights[i] = w;
+                indices[i] = e;
+                break;
+            }
+        }
+    }
+    
+    /* Check results: sorted descending */
+    ASSERT_EQ_INT(indices[0], 1);  /* 0.8 is highest */
+    ASSERT_NEAR(weights[0], 0.8f, 1e-6f);
+    
+    ASSERT_EQ_INT(indices[1], 3);  /* 0.6 is second */
+    ASSERT_NEAR(weights[1], 0.6f, 1e-6f);
+    
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Struct Size Verification Tests
  * ═══════════════════════════════════════════════════════════════════ */
 static void test_struct_sizes(void) {
@@ -658,6 +814,10 @@ int main(void) {
     printf("\n[Kernel Dispatch]\n");
     test_kernel_dispatch();
 
+    printf("\n[Matvec Correctness]\n");
+    test_matvec_4bit_correctness();
+    test_matvec_2bit_correctness();
+
     printf("\n[Sampling]\n");
     test_sampling_rng();
     test_sampling_rng_deterministic();
@@ -670,6 +830,10 @@ int main(void) {
     test_header_valid();
     test_header_bad_magic();
     test_header_zero_layers();
+
+    printf("\n[MoE Logic]\n");
+    test_header_moe_fields();
+    test_moe_router_logic();
 
     printf("\n[Struct Sizes]\n");
     test_struct_sizes();

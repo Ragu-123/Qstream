@@ -1,7 +1,16 @@
 /*
  * QStream - kernels_avx2.c
- * AVX2 + FMA optimized kernels for x86-64.
- * Compiled with -mavx2 -mfma flags.
+ * AVX2 + FMA + F16C optimized compute kernels for x86-64.
+ *
+ * Compiled with -mavx2 -mfma -mf16c flags.
+ *
+ * Key optimizations in fused dequant-matvec:
+ *   1. Zero-point factoring:
+ *      out[r] = Σ_b [ scale_b · dot(nibbles_b, input_b) + zero_b · sum(input_b) ]
+ *      The input block sums are precomputed ONCE and amortized across all rows.
+ *   2. 16-nibble-at-a-time unpack via low/high split + interleave.
+ *   3. 4-accumulator FMA pipeline to saturate port throughput.
+ *   4. F16C hardware FP16→FP32 for scale/zero metadata.
  */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
@@ -15,19 +24,396 @@
 #include "qsf/quant.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
-/* ── AVX2 fused dequant-matvec 4-bit ─────────────────────────────── */
-void qsf_matvec_4bit_avx2(const void* w, const float* in, float* out,
-                           int rows, int cols, int bs) {
-    /* For now, delegate to scalar. AVX2 optimization for inner loop
-       would unpack 4-bit values into __m256 and use _mm256_fmadd_ps. */
-    qsf_matvec_4bit_scalar(w, in, out, rows, cols, bs);
+/* ── Helpers ─────────────────────────────────────────────────────── */
+
+/* Horizontal sum of a 256-bit float vector → scalar float */
+static inline float hsum_avx(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s  = _mm_add_ps(lo, hi);        /* 4 floats */
+    s = _mm_hadd_ps(s, s);                 /* 2 floats */
+    s = _mm_hadd_ps(s, s);                 /* 1 float  */
+    return _mm_cvtss_f32(s);
 }
 
-/* ── AVX2 fused dequant-matvec 2-bit ─────────────────────────────── */
+/* Compute the sum of a float vector using AVX2 */
+static inline float block_sum_avx(const float* x, int n) {
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        s0 = _mm256_add_ps(s0, _mm256_loadu_ps(x + i));
+        s1 = _mm256_add_ps(s1, _mm256_loadu_ps(x + i + 8));
+    }
+    __m256 s = _mm256_add_ps(s0, s1);
+    float result = hsum_avx(s);
+    for (; i < n; i++) result += x[i];
+    return result;
+}
+
+/* ── AVX2 fused dequant-matvec: 4-bit asymmetric ────────────────── *
+ *
+ * Block layout (from quant.c):
+ *   [FP16 scale (2B)] [FP16 zero (2B)] [packed nibbles (bs/2 B)]
+ *   Even index i → low  nibble: byte[i/2] & 0x0F
+ *   Odd  index i → high nibble: byte[i/2] >> 4
+ *   Dequant: value = scale * nibble + zero
+ *
+ * Algebraic factoring (key insight — eliminates per-element zero mul):
+ *   out[r] = Σ_blocks [ scale_b · Σ_k(nib_k · in[col+k])
+ *                      + zero_b  · Σ_k(in[col+k])          ]
+ *
+ * Phase 1: Precompute input_block_sums[b] = Σ_k(in[b*bs..b*bs+bs-1])
+ *          Done once; cost amortized over all 'rows' output elements.
+ *
+ * Phase 2: For each row, iterate over blocks:
+ *   - F16C decode scale/zero from 2×FP16
+ *   - Unpack 16 nibbles at a time via low/high split + interleave
+ *   - 4-accumulator FMA: acc += nibble_float * input
+ *   - Reduce: out[r] = scale * hsum(acc) + zero * input_block_sum
+ */
+void qsf_matvec_4bit_avx2(const void* w, const float* in, float* out,
+                           int rows, int cols, int bs) {
+    if (rows <= 0 || cols <= 0) return;
+
+    const size_t block_bytes = qsf_quant_block_size(QSF_QUANT_4BIT_ASYM, bs);
+    const int num_blocks_per_row = (cols + bs - 1) / bs;
+    const __m128i lo_mask_128 = _mm_set1_epi8(0x0F);
+
+    /* ── Phase 1: Precompute input block sums ────────────────────── */
+    float* input_block_sums = (float*)malloc(num_blocks_per_row * sizeof(float));
+    if (!input_block_sums) {
+        /* OOM fallback to scalar */
+        qsf_matvec_4bit_scalar(w, in, out, rows, cols, bs);
+        return;
+    }
+    {
+        int col = 0;
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int count = (col + bs <= cols) ? bs : (cols - col);
+            input_block_sums[b] = block_sum_avx(in + col, count);
+            col += bs;
+        }
+    }
+
+    /* ── Phase 2: Row-major fused dequant-dot ────────────────────── */
+    const uint8_t* wp = (const uint8_t*)w;
+
+    for (int r = 0; r < rows; r++) {
+        __m256 row_acc = _mm256_setzero_ps();  /* accumulated: Σ scale*dot + zero*sum */
+        int col = 0;
+
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int count = (col + bs <= cols) ? bs : (cols - col);
+
+            /* ── Decode FP16 scale & zero via F16C ─────────────── */
+            uint16_t scale_h, zero_h;
+            memcpy(&scale_h, wp, 2);
+            memcpy(&zero_h, wp + 2, 2);
+
+            /* F16C: convert 2 FP16 values packed in a __m128i */
+            __m128i hpair = _mm_set_epi16(0,0,0,0, 0,0, zero_h, scale_h);
+            __m128 fpair  = _mm_cvtph_ps(hpair);  /* [scale, zero, 0, 0] */
+            float scale = _mm_cvtss_f32(fpair);
+            float zero  = _mm_cvtss_f32(_mm_shuffle_ps(fpair, fpair, 0x55));
+
+            const uint8_t* packed = wp + 4;
+
+            /* ── Fused nibble-dot: Σ nibble_k * input[col+k] ───── */
+            __m256 dot_acc0 = _mm256_setzero_ps();
+            __m256 dot_acc1 = _mm256_setzero_ps();
+            __m256 dot_acc2 = _mm256_setzero_ps();
+            __m256 dot_acc3 = _mm256_setzero_ps();
+
+            const float* inp = in + col;
+            int k = 0;
+
+            /*
+             * Process 32 nibbles (16 bytes packed) at a time → 4 × __m256 FMA.
+             * 16 packed bytes → 32 nibbles → 32 floats → 4 groups of 8.
+             *
+             * Nibble unpack strategy (per 8 packed bytes → 16 nibbles → 2×__m256):
+             *   1. Load 8 bytes into __m128i
+             *   2. lo = bytes & 0x0F  (even-index nibbles: 0,2,4,6,8,10,12,14)
+             *   3. hi = bytes >> 4     (odd-index nibbles:  1,3,5,7,9,11,13,15)
+             *   4. interleaved = unpacklo_epi8(lo, hi)  → [n0,n1,n2,n3,...,n15]
+             *   5. cvtepu8_epi32 lower 8 → __m256i → cvtepi32_ps → __m256 float
+             *   6. cvtepu8_epi32 upper 8 → __m256i → cvtepi32_ps → __m256 float
+             */
+            for (; k + 31 < count; k += 32) {
+                /* --- First 16 nibbles (8 packed bytes) --- */
+                __m128i raw0   = _mm_loadl_epi64((const __m128i*)(packed + k / 2));
+                __m128i lo0    = _mm_and_si128(raw0, lo_mask_128);
+                __m128i hi0    = _mm_and_si128(_mm_srli_epi16(raw0, 4), lo_mask_128);
+                __m128i nib0   = _mm_unpacklo_epi8(lo0, hi0);  /* 16 nibbles in order */
+
+                __m256i i32_a  = _mm256_cvtepu8_epi32(nib0);
+                __m256 fa      = _mm256_cvtepi32_ps(i32_a);
+                __m256 inp_a   = _mm256_loadu_ps(inp + k);
+                dot_acc0       = _mm256_fmadd_ps(fa, inp_a, dot_acc0);
+
+                __m256i i32_b  = _mm256_cvtepu8_epi32(_mm_srli_si128(nib0, 8));
+                __m256 fb      = _mm256_cvtepi32_ps(i32_b);
+                __m256 inp_b   = _mm256_loadu_ps(inp + k + 8);
+                dot_acc1       = _mm256_fmadd_ps(fb, inp_b, dot_acc1);
+
+                /* --- Second 16 nibbles (next 8 packed bytes) --- */
+                __m128i raw1   = _mm_loadl_epi64((const __m128i*)(packed + k / 2 + 8));
+                __m128i lo1    = _mm_and_si128(raw1, lo_mask_128);
+                __m128i hi1    = _mm_and_si128(_mm_srli_epi16(raw1, 4), lo_mask_128);
+                __m128i nib1   = _mm_unpacklo_epi8(lo1, hi1);
+
+                __m256i i32_c  = _mm256_cvtepu8_epi32(nib1);
+                __m256 fc      = _mm256_cvtepi32_ps(i32_c);
+                __m256 inp_c   = _mm256_loadu_ps(inp + k + 16);
+                dot_acc2       = _mm256_fmadd_ps(fc, inp_c, dot_acc2);
+
+                __m256i i32_d  = _mm256_cvtepu8_epi32(_mm_srli_si128(nib1, 8));
+                __m256 fd      = _mm256_cvtepi32_ps(i32_d);
+                __m256 inp_d   = _mm256_loadu_ps(inp + k + 24);
+                dot_acc3       = _mm256_fmadd_ps(fd, inp_d, dot_acc3);
+            }
+
+            /* Process remaining 16 nibbles (8 packed bytes) */
+            for (; k + 15 < count; k += 16) {
+                __m128i raw    = _mm_loadl_epi64((const __m128i*)(packed + k / 2));
+                __m128i lo     = _mm_and_si128(raw, lo_mask_128);
+                __m128i hi     = _mm_and_si128(_mm_srli_epi16(raw, 4), lo_mask_128);
+                __m128i nib    = _mm_unpacklo_epi8(lo, hi);
+
+                __m256i i32_a  = _mm256_cvtepu8_epi32(nib);
+                __m256 fa      = _mm256_cvtepi32_ps(i32_a);
+                dot_acc0       = _mm256_fmadd_ps(fa, _mm256_loadu_ps(inp + k), dot_acc0);
+
+                __m256i i32_b  = _mm256_cvtepu8_epi32(_mm_srli_si128(nib, 8));
+                __m256 fb      = _mm256_cvtepi32_ps(i32_b);
+                dot_acc1       = _mm256_fmadd_ps(fb, _mm256_loadu_ps(inp + k + 8), dot_acc1);
+            }
+
+            /* Scalar tail (< 16 remaining nibbles) */
+            float tail_dot = 0.0f;
+            for (; k < count; k++) {
+                int byte_idx = k / 2;
+                uint8_t q = (k % 2 == 0) ? (packed[byte_idx] & 0x0F)
+                                          : ((packed[byte_idx] >> 4) & 0x0F);
+                tail_dot += (float)q * inp[k];
+            }
+
+            /* ── Reduce: scale * dot(nib, inp) + zero * sum(inp) ─ */
+            __m256 combined = _mm256_add_ps(
+                _mm256_add_ps(dot_acc0, dot_acc1),
+                _mm256_add_ps(dot_acc2, dot_acc3)
+            );
+            float nib_dot = hsum_avx(combined) + tail_dot;
+
+            /* Factored affine: scale * Σ(nib*inp) + zero * Σ(inp) */
+            float block_result = scale * nib_dot + zero * input_block_sums[b];
+            row_acc = _mm256_add_ps(row_acc,
+                        _mm256_set_ps(0,0,0,0, 0,0,0, block_result));
+
+            col += bs;
+            wp += block_bytes;
+        }
+
+        out[r] = hsum_avx(row_acc);
+    }
+
+    free(input_block_sums);
+}
+
+/* ── AVX2 fused dequant-matvec: 4-bit symmetric ─────────────────── *
+ *
+ * Symmetric layout: [FP16 scale (2B)] [2B reserved] [packed nibbles]
+ * Dequant: value = scale * (nibble - 8)
+ *
+ * Factored: out[r] = Σ_b [ scale_b · (dot(nib, inp) - 8 · sum(inp)) ]
+ */
+void qsf_matvec_4bit_sym_avx2(const void* w, const float* in, float* out,
+                               int rows, int cols, int bs) {
+    if (rows <= 0 || cols <= 0) return;
+
+    const size_t block_bytes = qsf_quant_block_size(QSF_QUANT_4BIT_SYM, bs);
+    const int num_blocks_per_row = (cols + bs - 1) / bs;
+    const __m128i lo_mask_128 = _mm_set1_epi8(0x0F);
+
+    /* Precompute input block sums */
+    float* input_block_sums = (float*)malloc(num_blocks_per_row * sizeof(float));
+    if (!input_block_sums) {
+        qsf_matvec_4bit_sym_scalar(w, in, out, rows, cols, bs);
+        return;
+    }
+    {
+        int col = 0;
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int count = (col + bs <= cols) ? bs : (cols - col);
+            input_block_sums[b] = block_sum_avx(in + col, count);
+            col += bs;
+        }
+    }
+
+    const uint8_t* wp = (const uint8_t*)w;
+
+    for (int r = 0; r < rows; r++) {
+        float row_result = 0.0f;
+        int col = 0;
+
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int count = (col + bs <= cols) ? bs : (cols - col);
+
+            /* Decode scale via F16C (zero is unused in symmetric) */
+            uint16_t scale_h;
+            memcpy(&scale_h, wp, 2);
+            __m128i hval = _mm_set_epi16(0,0,0,0, 0,0,0, scale_h);
+            float scale  = _mm_cvtss_f32(_mm_cvtph_ps(hval));
+
+            const uint8_t* packed = wp + 4;
+            __m256 dot_acc0 = _mm256_setzero_ps();
+            __m256 dot_acc1 = _mm256_setzero_ps();
+            const float* inp = in + col;
+            int k = 0;
+
+            for (; k + 15 < count; k += 16) {
+                __m128i raw  = _mm_loadl_epi64((const __m128i*)(packed + k / 2));
+                __m128i lo   = _mm_and_si128(raw, lo_mask_128);
+                __m128i hi   = _mm_and_si128(_mm_srli_epi16(raw, 4), lo_mask_128);
+                __m128i nib  = _mm_unpacklo_epi8(lo, hi);
+
+                __m256i i32a = _mm256_cvtepu8_epi32(nib);
+                __m256 fa    = _mm256_cvtepi32_ps(i32a);
+                dot_acc0     = _mm256_fmadd_ps(fa, _mm256_loadu_ps(inp + k), dot_acc0);
+
+                __m256i i32b = _mm256_cvtepu8_epi32(_mm_srli_si128(nib, 8));
+                __m256 fb    = _mm256_cvtepi32_ps(i32b);
+                dot_acc1     = _mm256_fmadd_ps(fb, _mm256_loadu_ps(inp + k + 8), dot_acc1);
+            }
+
+            float tail_dot = 0.0f;
+            for (; k < count; k++) {
+                int byte_idx = k / 2;
+                uint8_t q = (k % 2 == 0) ? (packed[byte_idx] & 0x0F)
+                                          : ((packed[byte_idx] >> 4) & 0x0F);
+                tail_dot += (float)q * inp[k];
+            }
+
+            float nib_dot = hsum_avx(_mm256_add_ps(dot_acc0, dot_acc1)) + tail_dot;
+            /* Symmetric: value = scale * (nib - 8), factored: scale*(dot - 8*sum) */
+            row_result += scale * (nib_dot - 8.0f * input_block_sums[b]);
+
+            col += bs;
+            wp += block_bytes;
+        }
+
+        out[r] = row_result;
+    }
+
+    free(input_block_sums);
+}
+
+/* ── AVX2 fused dequant-matvec: 2-bit ───────────────────────────── *
+ *
+ * Block layout: [FP16 scale (2B)] [FP16 zero (2B)] [packed 2-bit (bs/4 B)]
+ * Dequant: value = scale * crumb + zero   (crumb ∈ {0,1,2,3})
+ *
+ * Unpack strategy: extract 4 crumbs per byte via successive shift+mask,
+ * then widen to float for FMA.
+ */
 void qsf_matvec_2bit_avx2(const void* w, const float* in, float* out,
                            int rows, int cols, int bs) {
-    qsf_matvec_2bit_scalar(w, in, out, rows, cols, bs);
+    if (rows <= 0 || cols <= 0) return;
+
+    const size_t block_bytes = qsf_quant_block_size(QSF_QUANT_2BIT_ASYM, bs);
+    const int num_blocks_per_row = (cols + bs - 1) / bs;
+
+    /* Precompute input block sums */
+    float* input_block_sums = (float*)malloc(num_blocks_per_row * sizeof(float));
+    if (!input_block_sums) {
+        qsf_matvec_2bit_scalar(w, in, out, rows, cols, bs);
+        return;
+    }
+    {
+        int col = 0;
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int count = (col + bs <= cols) ? bs : (cols - col);
+            input_block_sums[b] = block_sum_avx(in + col, count);
+            col += bs;
+        }
+    }
+
+    const uint8_t* wp = (const uint8_t*)w;
+
+    for (int r = 0; r < rows; r++) {
+        float row_result = 0.0f;
+        int col = 0;
+
+        for (int b = 0; b < num_blocks_per_row; b++) {
+            int count = (col + bs <= cols) ? bs : (cols - col);
+
+            uint16_t scale_h, zero_h;
+            memcpy(&scale_h, wp, 2);
+            memcpy(&zero_h, wp + 2, 2);
+            __m128i hpair = _mm_set_epi16(0,0,0,0, 0,0, zero_h, scale_h);
+            __m128 fpair  = _mm_cvtph_ps(hpair);
+            float scale = _mm_cvtss_f32(fpair);
+            float zero  = _mm_cvtss_f32(_mm_shuffle_ps(fpair, fpair, 0x55));
+
+            const uint8_t* packed = wp + 4;
+            __m256 dot_acc0 = _mm256_setzero_ps();
+            __m256 dot_acc1 = _mm256_setzero_ps();
+            const float* inp = in + col;
+            int k = 0;
+
+            /* Process 8 crumbs (2 bytes) at a time → 1 × __m256 FMA
+             * Byte layout: each byte has 4 crumbs at bits [1:0], [3:2], [5:4], [7:6]
+             * Two bytes → 8 crumbs → 8 floats → 1 __m256 FMA */
+            for (; k + 15 < count; k += 16) {
+                /* First 8 crumbs from 2 bytes */
+                uint32_t raw0;
+                memcpy(&raw0, packed + k / 4, 2);  /* 2 bytes = 8 crumbs */
+                /* Unpack: spread each 2-bit crumb into a 32-bit lane */
+                __m256i bits0 = _mm256_set_epi32(
+                    (raw0 >> 14) & 3, (raw0 >> 12) & 3,
+                    (raw0 >> 10) & 3, (raw0 >>  8) & 3,
+                    (raw0 >>  6) & 3, (raw0 >>  4) & 3,
+                    (raw0 >>  2) & 3, (raw0 >>  0) & 3
+                );
+                __m256 f0 = _mm256_cvtepi32_ps(bits0);
+                dot_acc0  = _mm256_fmadd_ps(f0, _mm256_loadu_ps(inp + k), dot_acc0);
+
+                /* Second 8 crumbs from next 2 bytes */
+                uint32_t raw1;
+                memcpy(&raw1, packed + k / 4 + 2, 2);
+                __m256i bits1 = _mm256_set_epi32(
+                    (raw1 >> 14) & 3, (raw1 >> 12) & 3,
+                    (raw1 >> 10) & 3, (raw1 >>  8) & 3,
+                    (raw1 >>  6) & 3, (raw1 >>  4) & 3,
+                    (raw1 >>  2) & 3, (raw1 >>  0) & 3
+                );
+                __m256 f1 = _mm256_cvtepi32_ps(bits1);
+                dot_acc1  = _mm256_fmadd_ps(f1, _mm256_loadu_ps(inp + k + 8), dot_acc1);
+            }
+
+            /* Scalar tail */
+            float tail_dot = 0.0f;
+            for (; k < count; k++) {
+                int byte_idx = k / 4;
+                int bit_off  = (k % 4) * 2;
+                uint8_t q = (packed[byte_idx] >> bit_off) & 0x03;
+                tail_dot += (float)q * inp[k];
+            }
+
+            float nib_dot = hsum_avx(_mm256_add_ps(dot_acc0, dot_acc1)) + tail_dot;
+            row_result += scale * nib_dot + zero * input_block_sums[b];
+
+            col += bs;
+            wp += block_bytes;
+        }
+
+        out[r] = row_result;
+    }
+
+    free(input_block_sums);
 }
 
 /* ── AVX2 vector add ─────────────────────────────────────────────── */
