@@ -1316,77 +1316,37 @@ class GptOssLoader(TensorLoader):
 
     def _dequant_mxfp4(self, blocks, scales):
         # blocks: [ROWS, N_BLOCKS, 16], uint8
-        # scales: [ROWS, N_BLOCKS], float (or castable)
+        # scales: [ROWS, N_BLOCKS], float
         
         rows, n_blocks, _ = blocks.shape
         
-        # 1. Unpack uint8 -> two int4 (or rather 4-bit values)
-        # Only support generic unsigned unpacking for now, scaling handles sign?
-        # Re-reading MXFP4 spec or assuming common:
-        # Usually E2M1 or similar. 
-        # But wait, user said "gpt-oss".
-        # Let's assume standard packed int4 (low nibble, high nibble) mapped to -8..7 or similar?
-        # Actually checking config: "mxfp4".
-        # Assume simple: (value - 8) * scale? Or standard 4-bit?
-        # Without exact specs, let's try standard int4 symmetric dequant.
-        # unpack:
-        # b[...][i] has lo (bits 0-3) and hi (bits 4-7)
-        
+        # 1. Unpack uint8 -> two 4-bit indices
+        # blocks is uint8 (guaranteed by get_tensor fix)
         lower = blocks & 0x0F
         upper = (blocks >> 4) & 0x0F
         
-        # Stack to get 32 values: [ROWS, N_BLOCKS, 16, 2] -> [ROWS, N_BLOCKS, 32]
-        # Make a temporary with shape [..., 32]
-        unpacked = np.empty((rows, n_blocks, 32), dtype=np.float32)
-        unpacked[:, :, 0::2] = lower
-        unpacked[:, :, 1::2] = upper
-        
-        # Map 0..15 to something?
-        # MXFP4 is usually E2M1. 
-        # codes = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6] ?
-        # Or simple integer?
-        # "mxfp4" usually implies Microscaling formats involving E2M1.
-        # Let's assume the values are effectively 4-bit floating point lookups.
-        # Lookup table for E2M1:
-        # [0, 0.5, 1, 1.5, 2, 3, 4, 6] (positive)
-        # sign bit handled?
-        # If it's pure 4-bit float, we need a lookup table.
-        # If it's int4, it's (x - zero) * scale.
-        
-        # QStream author note: If we don't know, treat as int4 symmetric for now (-8..7).
-        # unpacked = unpacked - 8.0?
-        # But if scales are large, fine.
-        
-        # Let's try: (unpacked - 8) * scale? 
-        # Or if the blocks are "mxfp4", they are indices into a codebook.
-        # Codebook for standard E2M1:
-        # 0000 -> 0
-        # 0001 -> 0.5
-        # ...
-        # If we assume it's just raw 4-bit integers scaled:
-        # unpacked = (unpacked.astype(np.float32) - 8.0) * scales_expanded
-        
-        # Wait, scales shape is [ROWS, N_BLOCKS]
-        # We need to broadcast scale to [ROWS, N_BLOCKS, 32]
-        scales_bd = scales[:, :, np.newaxis]
-        
-        # Apply E2M1 lookup table (common for MXFP4)
-        # S E1 M2 (1 sign, 2 exp, 1 mantissa)? No E2M1 is 2 exp 1 mantissa.
-        # 4 bits.
-        # Standard OCP MXFP4:
-        # P0, P1, ...
-        # Let's try a simple lookup suitable for E2M1.
+        # 2. Lookup values directly (E2M1)
+        # Avoid creating intermediate large float/int arrays
         mxfp4_lut = np.array([
             0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,   # 0-7
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 # 8-15 (sign bit set?)
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 # 8-15
         ], dtype=np.float32)
+
+        # Lookup: uint8 -> float32 [ROWS, N_BLOCKS, 16]
+        val_low  = mxfp4_lut[lower]
+        val_high = mxfp4_lut[upper]
         
-        # Using indices (unpacked is 0..15)
-        indices = unpacked.astype(np.int32)
-        values = mxfp4_lut[indices]
+        # 3. Apply scales
+        # scales: [ROWS, N_BLOCKS] -> [ROWS, N_BLOCKS, 1]
+        s_bd = scales[:, :, np.newaxis]
+        val_low  *= s_bd
+        val_high *= s_bd
         
-        # Multiply by scale
-        result = values * scales_bd
+        # 4. Interleave into result
+        # [ROWS, N_BLOCKS, 32]
+        result = np.empty((rows, n_blocks, 32), dtype=np.float32)
+        result[:, :, 0::2] = val_low
+        result[:, :, 1::2] = val_high
         
         # Reshape to [ROWS, COLS]
         return result.reshape(rows, -1)
