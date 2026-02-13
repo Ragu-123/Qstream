@@ -745,11 +745,34 @@ class QSFWriter:
 
             # ── 4. Write each layer ──
             mapping = get_tensor_mapping(arch, num_layers, cfg)
-            for layer_idx in tqdm(range(num_layers), desc="Converting layers"):
-                # log.info(f"  Layer {layer_idx}/{num_layers-1}")
-                entry = self._write_layer(f, loader, mapping,
-                                          layer_idx, arch, cfg)
-                layer_entries.append(entry)
+            
+            # Parallel execution
+            import concurrent.futures
+            import io
+            
+            def process_layer(layer_idx):
+                buf = io.BytesIO()
+                try:
+                    entry = self._write_layer(buf, loader, mapping,
+                                              layer_idx, arch, cfg)
+                    return entry, buf.getvalue()
+                except Exception as e:
+                    return e, None
+
+            # Use 4 workers to balance CPU/IO without OOM
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                # Map preserves order
+                results = executor.map(process_layer, range(num_layers))
+                
+                for (entry, data) in tqdm(results, total=num_layers, desc="Converting layers"):
+                    if isinstance(entry, Exception):
+                        log.error(f"Layer failed: {entry}")
+                        raise entry
+                    
+                    if entry is None: continue
+
+                    f.write(data)
+                    layer_entries.append(entry)
 
             # ── 5. Write final section (norm + output head) ──
             final_offset = self._align_offset(f)
@@ -1152,6 +1175,22 @@ class GptOssLoader(TensorLoader):
         else:
             self.device_obj = None
 
+    def _load_slice(self, tensor_name, index):
+        """Load a single slice of a tensor directly from safetensors."""
+        if tensor_name not in self.tensors:
+            return None
+        fpath, key = self.tensors[tensor_name]
+        
+        if not HAS_SAFETENSORS: 
+            return None
+            
+        # Use 'pt' backend to get torch tensor directly
+        # 'cpu' device to avoid OOM if we load too many, then move to GPU
+        with safe_open(fpath, framework='pt', device='cpu') as f:
+            valid_slice = f.get_slice(key)
+            # Access index ensures we only read that chunk from disk
+            return valid_slice[index]
+
     def keys(self):
         # Yield physical keys AND virtual keys for experts
         for name in super().keys():
@@ -1259,36 +1298,25 @@ class GptOssLoader(TensorLoader):
         else:
             return super().get_tensor(name)
 
-        # Load blocks and scales (physically stacked)
-        # Use cached loader to avoid re-reading 2GB tensor 32 times
-        blocks = self._get_cached_tensor(f'{base}_blocks')
-        scales = self._get_cached_tensor(f'{base}_scales')
+        # Load blocks and scales using direct slicing to avoid RAM swap
+        # Physical tensor: [32, rows, cols, 16] -> slice [e_idx] -> [rows, cols, 16]
+        exp_blocks = self._load_slice(f'{base}_blocks', e_idx)
+        exp_scales = self._load_slice(f'{base}_scales', e_idx)
         
-        if blocks is None or scales is None:
-            # Maybe not quantized? Try loading raw weight
-            raw_name = f'{base}.weight'
-            # But the raw weight is likely stacked too
-            # The user config says "quant_method": "mxfp4", so blocks/scales should exist.
-            # If not, try loading strict name?
+        if exp_blocks is None or exp_scales is None:
+            # Maybe not quantized? 
             return None
-
-        # Dimensions
-        # blocks: [NUM_EXPERTS, ROWS, BLOCKS_PER_ROW, 16]
-        # scales: [NUM_EXPERTS, ROWS, BLOCKS_PER_ROW]
-        
-        # 1. Extract expert slice
-        # blocks: [ROWS, BLOCKS_PER_ROW, 16]
-        # scales: [ROWS, BLOCKS_PER_ROW]
-        exp_blocks = blocks[e_idx]
-        exp_scales = scales[e_idx]
         
         # Move to GPU if requested
         if self.device_obj is not None:
-             if isinstance(exp_blocks, np.ndarray):
-                 exp_blocks = torch.from_numpy(exp_blocks).to(self.device_obj)
-             if isinstance(exp_scales, np.ndarray):
-                 exp_scales = torch.from_numpy(exp_scales).to(self.device_obj)
-        
+             if not isinstance(exp_blocks, torch.Tensor):
+                 exp_blocks = torch.from_numpy(exp_blocks)
+             if not isinstance(exp_scales, torch.Tensor):
+                 exp_scales = torch.from_numpy(exp_scales)
+                 
+             exp_blocks = exp_blocks.to(self.device_obj)
+             exp_scales = exp_scales.to(self.device_obj)
+             
         # 2. Dequantize
         # Result shape: [ROWS, COLS] where COLS = BLOCKS_PER_ROW * 32
         data = self._dequant_mxfp4(exp_blocks, exp_scales)
@@ -1327,15 +1355,18 @@ class GptOssLoader(TensorLoader):
         else:
             return super().get_tensor(name)
 
-        # Load physical stacked bias
-        # Shape: [NUM_EXPERTS, ROWS]
-        physical_bias = self._get_cached_tensor(base)
-        if physical_bias is None:
+        # Load physical stacked bias slice
+        # Shape: [NUM_EXPERTS, ROWS] -> Slice [e_idx] -> [ROWS]
+        exp_bias = self._load_slice(base, e_idx)
+        
+        if exp_bias is None:
             return None
-
-        # 1. Extract expert slice
-        # Shape: [ROWS]
-        exp_bias = physical_bias[e_idx]
+            
+        # Move to GPU/Numpy
+        if getattr(exp_bias, 'is_cuda', False):
+             exp_bias = exp_bias.cpu().numpy()
+        elif isinstance(exp_bias, torch.Tensor):
+             exp_bias = exp_bias.numpy()
 
         # 2. Split if gate_up
         if is_gate_up:
