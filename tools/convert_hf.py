@@ -45,7 +45,6 @@ try:
 except ImportError:
     tqdm = lambda x, **kwargs: x
 
-from functools import lru_cache
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger('convert_hf')
@@ -743,36 +742,12 @@ class QSFWriter:
             tok_bytes = serialize_tokenizer(tok_data)
             f.write(tok_bytes)
 
-            # ── 4. Write each layer ──
+            # ── 4. Write each layer (sequential + batch preload) ──
             mapping = get_tensor_mapping(arch, num_layers, cfg)
-            
-            # Parallel execution
-            import concurrent.futures
-            import io
-            
-            def process_layer(layer_idx):
-                buf = io.BytesIO()
-                try:
-                    entry = self._write_layer(buf, loader, mapping,
-                                              layer_idx, arch, cfg)
-                    return entry, buf.getvalue()
-                except Exception as e:
-                    return e, None
-
-            # Use 16 workers to maximize throughput
-            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
-                # Map preserves order
-                results = executor.map(process_layer, range(num_layers))
-                
-                for (entry, data) in tqdm(results, total=num_layers, desc="Converting layers"):
-                    if isinstance(entry, Exception):
-                        log.error(f"Layer failed: {entry}")
-                        raise entry
-                    
-                    if entry is None: continue
-
-                    f.write(data)
-                    layer_entries.append(entry)
+            for layer_idx in tqdm(range(num_layers), desc="Converting layers"):
+                entry = self._write_layer(f, loader, mapping,
+                                          layer_idx, arch, cfg)
+                layer_entries.append(entry)
 
             # ── 5. Write final section (norm + output head) ──
             final_offset = self._align_offset(f)
@@ -1002,6 +977,10 @@ class QSFWriter:
                      mapping: Dict, layer_idx: int,
                      arch: str, cfg: dict) -> bytes:
         """Write one transformer layer, return 48-byte layer index entry."""
+        # Batch-preload all expert tensors for this layer
+        if hasattr(loader, 'preload_layer'):
+            loader.preload_layer(layer_idx)
+        
         offset = self._align_offset(f)
         start_pos = f.tell()
 
@@ -1112,6 +1091,9 @@ class QSFWriter:
             0,                                   # layer_ffn_dim (0=use global)
             0,                                   # reserved (8 bytes)
         )
+        # Free batch cache after processing layer
+        if hasattr(loader, 'clear_batch_cache'):
+            loader.clear_batch_cache()
         return entry[:48]  # ensure 48 bytes
 
     def _write_final(self, f, loader: TensorLoader,
@@ -1166,6 +1148,12 @@ class QSFWriter:
 # GPT-OSS Loader (MXFP4 handling)
 ###############################################################################
 class GptOssLoader(TensorLoader):
+    """Loader for GPT-OSS models with MXFP4 quantized stacked experts.
+    
+    Uses batch-load-then-cache: loads stacked tensors ONCE per layer,
+    batch-dequants ALL 32 experts in one GPU operation, caches results.
+    Reduces file opens from ~4600 to ~144 and GPU ops from ~2300 to ~48.
+    """
     def __init__(self, model_dir, num_experts, device='cpu'):
         super().__init__(model_dir)
         self.num_experts = num_experts
@@ -1174,47 +1162,114 @@ class GptOssLoader(TensorLoader):
             self.device_obj = torch.device(device)
         else:
             self.device_obj = None
+        self._batch_cache = {}  # {('gate', expert_idx): tensor, ...}
 
-    def _load_slice(self, tensor_name, index):
-        """Load a single slice of a tensor directly from safetensors."""
-        if tensor_name not in self.tensors:
+    def _load_full_tensor_pt(self, name):
+        """Load full tensor as PyTorch tensor preserving original dtype."""
+        if name not in self.tensors:
             return None
-        fpath, key = self.tensors[tensor_name]
-        
-        if not HAS_SAFETENSORS: 
+        fpath, key = self.tensors[name]
+        if not HAS_SAFETENSORS:
             return None
-            
-        # Use 'pt' backend to get torch tensor directly
-        # 'cpu' device to avoid OOM if we load too many, then move to GPU
         with safe_open(fpath, framework='pt', device='cpu') as f:
-            valid_slice = f.get_slice(key)
-            # Access index ensures we only read that chunk from disk
-            return valid_slice[index]
+            return f.get_tensor(key)
+
+    def preload_layer(self, layer_idx):
+        """Batch-load and dequant ALL experts for a layer in one GPU shot."""
+        self._batch_cache.clear()
+        prefix = f'model.layers.{layer_idx}.mlp.experts'
+
+        # ── Batch-load weights ──
+        for proj in ['gate_up_proj', 'down_proj']:
+            blocks = self._load_full_tensor_pt(f'{prefix}.{proj}_blocks')
+            scales = self._load_full_tensor_pt(f'{prefix}.{proj}_scales')
+            if blocks is None or scales is None:
+                continue
+
+            # blocks: [E, R, B, 16]  scales: [E, R, B]
+            E, R, B, sixteen = blocks.shape
+
+            # Flatten expert+row dims for batch dequant
+            blocks_flat = blocks.reshape(E * R, B, sixteen)
+            scales_flat = scales.reshape(E * R, B)
+            del blocks, scales  # free CPU copies
+
+            # Move to GPU
+            if self.device_obj:
+                blocks_flat = blocks_flat.to(self.device_obj)
+                scales_flat = scales_flat.float().to(self.device_obj)
+            else:
+                # CPU path: ensure float32 scales
+                scales_flat = scales_flat.float()
+
+            # Batch dequant ALL experts at once (1 GPU kernel launch)
+            dequanted = self._dequant_mxfp4(blocks_flat, scales_flat)
+            del blocks_flat, scales_flat
+
+            # Reshape: [E*R, COLS] -> [E, R, COLS]
+            COLS = dequanted.shape[1]
+            dequanted = dequanted.reshape(E, R, COLS)
+
+            # Split and cache individual experts
+            is_gate_up = 'gate_up' in proj
+            for e in range(E):
+                expert_data = dequanted[e]  # [R, COLS]
+                if is_gate_up:
+                    split = R // 2
+                    self._batch_cache[('gate', e)] = expert_data[:split]
+                    self._batch_cache[('up', e)] = expert_data[split:]
+                else:
+                    self._batch_cache[('down', e)] = expert_data
+            del dequanted
+
+        # ── Batch-load biases (tiny, fast) ──
+        for proj, is_gu in [('gate_up_proj_bias', True), ('down_proj_bias', False)]:
+            bias = self._load_full_tensor_pt(f'{prefix}.{proj}')
+            if bias is None:
+                continue
+            bias = bias.float()  # BF16 -> F32
+            for e in range(bias.shape[0]):
+                eb = bias[e].numpy()
+                if is_gu:
+                    split = eb.shape[0] // 2
+                    self._batch_cache[('gate_bias', e)] = eb[:split]
+                    self._batch_cache[('up_bias', e)] = eb[split:]
+                else:
+                    self._batch_cache[('down_bias', e)] = eb
+            del bias
+
+        log.debug(f"  Preloaded layer {layer_idx}: {len(self._batch_cache)} cached tensors")
+
+    def clear_batch_cache(self):
+        """Free all cached tensors and GPU memory."""
+        self._batch_cache.clear()
+        if HAS_TORCH and self.device_obj:
+            torch.cuda.empty_cache()
 
     def keys(self):
         # Yield physical keys AND virtual keys for experts
         for name in super().keys():
             yield name
-            
-            # Use 'gate_up_proj_blocks' as triggers for virtual keys
-            # Name: model.layers.{L}.mlp.experts.gate_up_proj_blocks
             if 'mlp.experts.gate_up_proj_blocks' in name:
-                # Extract layer index
                 try:
                     parts = name.split('.')
-                    # model.layers.0.mlp...
                     l_idx = int(parts[2])
-                    prefix = f'model.layers.{l_idx}.mlp.experts'
-                    
+                    prefix = f'model.layers.{l_idx}.block_sparse_layer.experts'
                     for e in range(self.num_experts):
                         ep = f'{prefix}.{e}'
-                        yield f'{ep}.gate_proj.weight'
-                        yield f'{ep}.up_proj.weight'
-                        # Weights derived from blocks/scales, but we yield .weight key
+                        yield f'{ep}.gate.weight'
+                        yield f'{ep}.up.weight'
                 except:
                     pass
-
-            # Triggers for biases
+            if 'mlp.experts.down_proj_blocks' in name:
+                try:
+                    parts = name.split('.')
+                    l_idx = int(parts[2])
+                    prefix = f'model.layers.{l_idx}.block_sparse_layer.experts'
+                    for e in range(self.num_experts):
+                        yield f'{prefix}.{e}.down_proj.weight'
+                except:
+                    pass
             if 'mlp.experts.gate_up_proj_bias' in name:
                 try:
                     parts = name.split('.')
@@ -1222,164 +1277,67 @@ class GptOssLoader(TensorLoader):
                     prefix = f'model.layers.{l_idx}.mlp.experts'
                     for e in range(self.num_experts):
                         ep = f'{prefix}.{e}'
-                        yield f'{ep}.gate_proj.bias'
-                        yield f'{ep}.up_proj.bias'
+                        yield f'{ep}.gate.bias'
+                        yield f'{ep}.up.bias'
                 except:
                     pass
-
-            if 'mlp.experts.down_proj_blocks' in name:
-                try:
-                    parts = name.split('.')
-                    l_idx = int(parts[2])
-                    prefix = f'model.layers.{l_idx}.mlp.experts'
-                    for e in range(self.num_experts):
-                        ep = f'{prefix}.{e}'
-                        yield f'{ep}.down_proj.weight'
-                except:
-                    pass
-
             if 'mlp.experts.down_proj_bias' in name:
                 try:
                     parts = name.split('.')
                     l_idx = int(parts[2])
                     prefix = f'model.layers.{l_idx}.mlp.experts'
                     for e in range(self.num_experts):
-                        ep = f'{prefix}.{e}'
-                        yield f'{ep}.down_proj.bias'
+                        yield f'{prefix}.{e}.down_proj.bias'
                 except:
                     pass
 
-    @lru_cache(maxsize=8)
-    def _get_cached_tensor(self, name):
-        """Cache loaded tensors to avoid re-reading massive stacked tensors."""
-        return super().get_tensor(name)
-
     def get_tensor(self, name):
-        # 1. Check if it's a virtual expert tensor
-        # Pattern: model.layers.L.block_sparse_layer.experts.E.ROLE.weight
-        # where ROLE is gate_proj, up_proj, down_proj
-        # (Mapped from 'moe_gate_w_E', 'moe_up_w_E', 'moe_down_w_E')
-        
-        # We need to reverse-map or just handle the HF names requested by _write_layer
-        # The mapping in get_tensor_mapping produces names like:
-        # model.layers.0.block_sparse_layer.experts.0.gate.weight
-        
         if 'experts' in name:
             if 'weight' in name:
-                return self._load_virtual_expert_weight(name)
+                return self._get_expert_weight(name)
             elif 'bias' in name:
-                return self._load_virtual_expert_bias(name)
-        
-        # 2. Standard tensor
+                return self._get_expert_bias(name)
         return super().get_tensor(name)
 
-    def _load_virtual_expert_weight(self, name):
-        # Parse name: model.layers.{L}.block_sparse_layer.experts.{E}.{role}.weight
+    def _get_expert_weight(self, name):
+        """Return cached expert weight (already dequanted by preload_layer)."""
         try:
             parts = name.split('.')
-            l_idx = int(parts[2])
-            e_idx = int(parts[5])
-            role = parts[6] # gate, up, or down (from mapping)
-        except:
-            return super().get_tensor(name)
-
-        # Map to physical tensors
-        # Physical: model.layers.L.mlp.experts.gate_up_proj_blocks (stacked)
-        #           model.layers.L.mlp.experts.down_proj_blocks
-        
-        prefix = f'model.layers.{l_idx}.mlp.experts'
-        
-        if role in ('gate', 'up', 'w1', 'w3', 'gate_proj', 'up_proj'):
-            base = f'{prefix}.gate_up_proj'
-            is_gate_up = True
-        elif role in ('down', 'w2', 'down_proj'):
-            base = f'{prefix}.down_proj'
-            is_gate_up = False
-        else:
-            return super().get_tensor(name)
-
-        # Load blocks and scales using direct slicing to avoid RAM swap
-        # Physical tensor: [32, rows, cols, 16] -> slice [e_idx] -> [rows, cols, 16]
-        exp_blocks = self._load_slice(f'{base}_blocks', e_idx)
-        exp_scales = self._load_slice(f'{base}_scales', e_idx)
-        
-        if exp_blocks is None or exp_scales is None:
-            # Maybe not quantized? 
-            return None
-        
-        # Move to GPU if requested
-        if self.device_obj is not None:
-             if not isinstance(exp_blocks, torch.Tensor):
-                 exp_blocks = torch.from_numpy(exp_blocks)
-             if not isinstance(exp_scales, torch.Tensor):
-                 exp_scales = torch.from_numpy(exp_scales)
-                 
-             exp_blocks = exp_blocks.to(self.device_obj)
-             exp_scales = exp_scales.to(self.device_obj)
-             
-        # 2. Dequantize
-        # Result shape: [ROWS, COLS] where COLS = BLOCKS_PER_ROW * 32
-        data = self._dequant_mxfp4(exp_blocks, exp_scales)
-        
-        # 3. Split if gate_up
-        if is_gate_up:
-            # data is [GATE_ROWS + UP_ROWS, COLS]
-            # usually hidden_dim
-            rows = data.shape[0]
-            split = rows // 2
-            if role in ('gate', 'w1', 'gate_proj'):
-                return data[:split]
-            else:
-                return data[split:]
-        else:
-            return data
-
-    def _load_virtual_expert_bias(self, name):
-        # Parse name: model.layers.{L}.block_sparse_layer.experts.{E}.{role}.bias
-        try:
-            parts = name.split('.')
-            l_idx = int(parts[2])
             e_idx = int(parts[5])
             role = parts[6]
         except:
             return super().get_tensor(name)
 
-        prefix = f'model.layers.{l_idx}.mlp.experts'
-        
-        if role in ('gate', 'up', 'w1', 'w3', 'gate_proj', 'up_proj'):
-            base = f'{prefix}.gate_up_proj_bias'
-            is_gate_up = True
+        if role in ('gate', 'w1', 'gate_proj'):
+            key = ('gate', e_idx)
+        elif role in ('up', 'w3', 'up_proj'):
+            key = ('up', e_idx)
         elif role in ('down', 'w2', 'down_proj'):
-            base = f'{prefix}.down_proj_bias'
-            is_gate_up = False
+            key = ('down', e_idx)
         else:
             return super().get_tensor(name)
 
-        # Load physical stacked bias slice
-        # Shape: [NUM_EXPERTS, ROWS] -> Slice [e_idx] -> [ROWS]
-        exp_bias = self._load_slice(base, e_idx)
-        
-        if exp_bias is None:
-            return None
-            
-        # Move to GPU/Numpy
-        # Move to GPU/Numpy
-        # Ensure float32 for numpy compatibility (fixes BFloat16 error)
-        if getattr(exp_bias, 'is_cuda', False):
-             exp_bias = exp_bias.float().cpu().numpy()
-        elif isinstance(exp_bias, torch.Tensor):
-             exp_bias = exp_bias.float().numpy()
+        return self._batch_cache.get(key)
 
-        # 2. Split if gate_up
-        if is_gate_up:
-            rows = exp_bias.shape[0]
-            split = rows // 2
-            if role in ('gate', 'w1', 'gate_proj'):
-                return exp_bias[:split]
-            else:
-                return exp_bias[split:]
+    def _get_expert_bias(self, name):
+        """Return cached expert bias."""
+        try:
+            parts = name.split('.')
+            e_idx = int(parts[5])
+            role = parts[6]
+        except:
+            return super().get_tensor(name)
+
+        if role in ('gate', 'w1', 'gate_proj'):
+            key = ('gate_bias', e_idx)
+        elif role in ('up', 'w3', 'up_proj'):
+            key = ('up_bias', e_idx)
+        elif role in ('down', 'w2', 'down_proj'):
+            key = ('down_bias', e_idx)
         else:
-            return exp_bias
+            return super().get_tensor(name)
+
+        return self._batch_cache.get(key)
 
     def _dequant_mxfp4(self, blocks, scales):
         # blocks: [ROWS, N_BLOCKS, 16], uint8
@@ -1527,44 +1485,8 @@ Examples:
                         help='LZ4-compress layer data')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Verbose output')
-
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    model_dir = Path(args.model_dir)
-    if not model_dir.is_dir():
-        log.error(f"Not a directory: {model_dir}")
-        sys.exit(1)
-
-    # 1. Parse config
-    log.info(f"Loading model from: {model_dir}")
-    config = parse_config(model_dir)
-    arch = detect_architecture(config)
-
-    log.info(f"Architecture: {arch}")
-    log.info(f"  Hidden dim:  {config['hidden_size']}")
-    log.info(f"  Layers:      {config['num_hidden_layers']}")
-    log.info(f"  Heads:       {config['num_attention_heads']}")
-    log.info(f"  KV heads:    {config.get('num_key_value_heads', config['num_attention_heads'])}")
-    log.info(f"  Vocab:       {config['vocab_size']}")
-    log.info(f"  Intermediate:{config.get('intermediate_size', '?')}")
-
-    # 2. Parse tokenizer
-    tok_data = parse_tokenizer(model_dir)
-
-    # 3. Index tensors
-    if arch == 'gpt_oss':
-        num_experts = config.get('num_local_experts', 32)
-        loader = GptOssLoader(args.model_dir, num_experts)
-    else:
-        loader = TensorLoader(args.model_dir)
-
-    # 4. Convert
-    quant_type = QUANT_TYPE_MAP[args.quant]
     parser.add_argument('--device', default='cuda' if HAS_TORCH and torch.cuda.is_available() else 'cpu',
-                        help='Device to use (e.g. cpu, cuda, cuda:0)')
+                        help='Device for quantization (cpu, cuda, cuda:0)')
 
     args = parser.parse_args()
 
@@ -1595,14 +1517,6 @@ Examples:
     # 3. Index tensors
     if arch == 'gpt_oss':
         num_experts = config.get('num_local_experts', 32)
-        # Pass device to loader? 
-        # We need to update GptOssLoader signature first if we want to pass it
-        # For now let's modify main to pass it if GptOssLoader accepts it
-        # Assuming we will update GptOssLoader next.
-        # But wait, python will error if __init__ doesn't match
-        # So we update GptOssLoader separately.
-        
-        # We'll stick to old init for now, update Loader signature in next step
         loader = GptOssLoader(args.model_dir, num_experts, device=args.device)
     else:
         loader = TensorLoader(args.model_dir)
