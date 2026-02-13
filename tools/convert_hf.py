@@ -682,13 +682,22 @@ class QSFWriter:
     """Writes QSF format files."""
 
     def __init__(self, output_path: str, config: dict, quant_type: int,
-                 block_size: int = 64, compress: bool = False):
+                 block_size: int = 64, compress: bool = False, device: str = 'cpu'):
         self.output_path = output_path
         self.config = config
         self.quant_type = quant_type
         self.block_size = block_size
         self.compress = compress and HAS_LZ4
-        self.quantizer = Quantizer(quant_type, block_size)
+        
+        self.device = device
+        if device.startswith('cuda') and HAS_TORCH:
+            log.info(f"Using GPU quantization on {device}")
+            self.quantizer = GPUQuantizer(quant_type, block_size, device)
+            # Norms stay on CPU (fp16) or could be moved? CPU is fine for small norms
+            self.norm_quantizer = Quantizer(QUANT_FP16, block_size)
+        else:
+            self.quantizer = Quantizer(quant_type, block_size)
+            self.norm_quantizer = Quantizer(QUANT_FP16, block_size)
         self.norm_quantizer = Quantizer(QUANT_FP16, block_size)
 
     def write(self, loader: TensorLoader, arch: str, tok_data: dict):
@@ -1127,9 +1136,14 @@ class QSFWriter:
 # GPT-OSS Loader (MXFP4 handling)
 ###############################################################################
 class GptOssLoader(TensorLoader):
-    def __init__(self, model_dir, num_experts):
+    def __init__(self, model_dir, num_experts, device='cpu'):
         super().__init__(model_dir)
         self.num_experts = num_experts
+        self.device = device
+        if HAS_TORCH and device.startswith('cuda'):
+            self.device_obj = torch.device(device)
+        else:
+            self.device_obj = None
 
     def keys(self):
         # Yield physical keys AND virtual keys for experts
@@ -1255,6 +1269,13 @@ class GptOssLoader(TensorLoader):
         exp_blocks = blocks[e_idx]
         exp_scales = scales[e_idx]
         
+        # Move to GPU if requested
+        if self.device_obj is not None:
+             if isinstance(exp_blocks, np.ndarray):
+                 exp_blocks = torch.from_numpy(exp_blocks).to(self.device_obj)
+             if isinstance(exp_scales, np.ndarray):
+                 exp_scales = torch.from_numpy(exp_scales).to(self.device_obj)
+        
         # 2. Dequantize
         # Result shape: [ROWS, COLS] where COLS = BLOCKS_PER_ROW * 32
         data = self._dequant_mxfp4(exp_blocks, exp_scales)
@@ -1318,6 +1339,10 @@ class GptOssLoader(TensorLoader):
         # blocks: [ROWS, N_BLOCKS, 16], uint8
         # scales: [ROWS, N_BLOCKS], float
         
+        # Check for GPU execution
+        if HAS_TORCH and isinstance(blocks, torch.Tensor):
+             return self._dequant_mxfp4_torch(blocks, scales)
+        
         rows, n_blocks, _ = blocks.shape
         
         # 1. Unpack uint8 -> two 4-bit indices
@@ -1349,6 +1374,41 @@ class GptOssLoader(TensorLoader):
         result[:, :, 1::2] = val_high
         
         # Reshape to [ROWS, COLS]
+        return result.reshape(rows, -1)
+
+    def _dequant_mxfp4_torch(self, blocks, scales):
+        """GPU/PyTorch implementation of MXFP4 dequantization."""
+        rows, n_blocks, _ = blocks.shape
+        
+        # 1. Unpack uint8 -> two 4-bit indices
+        lower = blocks & 0x0F
+        upper = (blocks >> 4) & 0x0F
+        
+        # 2. Lookup values
+        # Create LUT on same device
+        mxfp4_lut = torch.tensor([
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,   # 0-7
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 # 8-15
+        ], dtype=torch.float32, device=blocks.device)
+        
+        val_low = mxfp4_lut[lower.long()]
+        val_high = mxfp4_lut[upper.long()]
+        
+        # 3. Apply scales
+        # scales: [ROWS, N_BLOCKS] -> [ROWS, N_BLOCKS, 1]
+        if isinstance(scales, np.ndarray): # ensure torch
+             scales = torch.from_numpy(scales).to(blocks.device)
+             
+        s_bd = scales.unsqueeze(-1)
+        val_low  *= s_bd
+        val_high *= s_bd
+        
+        # 4. Interleave
+        # [ROWS, N_BLOCKS, 32]
+        result = torch.empty((rows, n_blocks, 32), dtype=torch.float32, device=blocks.device)
+        result[:, :, 0::2] = val_low
+        result[:, :, 1::2] = val_high
+        
         return result.reshape(rows, -1)
 def parse_config(model_dir: Path) -> dict:
     """Parse config.json from model directory."""
@@ -1457,12 +1517,150 @@ Examples:
 
     # 4. Convert
     quant_type = QUANT_TYPE_MAP[args.quant]
+    parser.add_argument('--device', default='cuda' if HAS_TORCH and torch.cuda.is_available() else 'cpu',
+                        help='Device to use (e.g. cpu, cuda, cuda:0)')
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    model_dir = Path(args.model_dir)
+    if not model_dir.is_dir():
+        log.error(f"Not a directory: {model_dir}")
+        sys.exit(1)
+
+    # 1. Parse config
+    log.info(f"Loading model from: {model_dir}")
+    config = parse_config(model_dir)
+    arch = detect_architecture(config)
+
+    log.info(f"Architecture: {arch}")
+    log.info(f"  Hidden dim:  {config['hidden_size']}")
+    log.info(f"  Layers:      {config['num_hidden_layers']}")
+    log.info(f"  Heads:       {config['num_attention_heads']}")
+    log.info(f"  KV heads:    {config.get('num_key_value_heads', config['num_attention_heads'])}")
+    log.info(f"  Vocab:       {config['vocab_size']}")
+    log.info(f"  Intermediate:{config.get('intermediate_size', '?')}")
+
+    # 2. Parse tokenizer
+    tok_data = parse_tokenizer(model_dir)
+
+    # 3. Index tensors
+    if arch == 'gpt_oss':
+        num_experts = config.get('num_local_experts', 32)
+        # Pass device to loader? 
+        # We need to update GptOssLoader signature first if we want to pass it
+        # For now let's modify main to pass it if GptOssLoader accepts it
+        # Assuming we will update GptOssLoader next.
+        # But wait, python will error if __init__ doesn't match
+        # So we update GptOssLoader separately.
+        
+        # We'll stick to old init for now, update Loader signature in next step
+        loader = GptOssLoader(args.model_dir, num_experts, device=args.device)
+    else:
+        loader = TensorLoader(args.model_dir)
+
+    # 4. Convert
+    quant_type = QUANT_TYPE_MAP[args.quant]
     writer = QSFWriter(args.output, config, quant_type,
                        block_size=args.block_size,
-                       compress=args.compress)
+                       compress=args.compress,
+                       device=args.device)
     writer.write(loader, arch, tok_data)
 
     log.info("Conversion complete!")
+
+
+
+###############################################################################
+# GPU Quantizer (PyTorch-based)
+###############################################################################
+class GPUQuantizer:
+    """Accelerated quantization using PyTorch on GPU."""
+    def __init__(self, quant_type: int, block_size: int = 64, device='cuda'):
+        self.quant_type = quant_type
+        self.block_size = block_size
+        self.device = device
+        if HAS_TORCH:
+            self.device = torch.device(device)
+
+    def quantize_tensor(self, tensor) -> Tuple[bytes, int, int]:
+        """Quantize a tensor on GPU. Input must be a torch tensor (on GPU/CPU)."""
+        if not HAS_TORCH:
+            raise RuntimeError("GPU quantization requires PyTorch")
+            
+        if isinstance(tensor, np.ndarray):
+            tensor = torch.from_numpy(tensor).to(self.device)
+            
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        rows, cols = tensor.shape
+        
+        # Move to GPU if needed
+        if tensor.device.type != 'cuda':
+            tensor = tensor.to(self.device)
+            
+        # Only support 4-bit Asym for fast path
+        if self.quant_type == QUANT_4BIT_ASYM:
+            return self._quant_4bit_asym_gpu(tensor), rows, cols
+        elif self.quant_type == QUANT_FP16:
+             # Fast FP16 path
+             return tensor.half().cpu().numpy().tobytes(), rows, cols
+        else:
+            # Fallback for other modes
+            cpu_tensor = tensor.float().cpu().numpy()
+            q = Quantizer(self.quant_type, self.block_size)
+            return q.quantize_tensor(cpu_tensor)
+
+    def _quant_4bit_asym_gpu(self, tensor: torch.Tensor) -> bytes:
+        # Reshape to blocks: [N_BLOCKS, BLOCK_SIZE]
+        # Pad if needed
+        numel = tensor.numel()
+        bs = self.block_size
+        pad_len = (bs - (numel % bs)) % bs
+        if pad_len > 0:
+            tensor = torch.nn.functional.pad(tensor.reshape(-1), (0, pad_len)).reshape(-1, bs)
+        else:
+            tensor = tensor.reshape(-1, bs)
+            
+        # 1. Min/Max
+        bmin = tensor.min(dim=1).values
+        bmax = tensor.max(dim=1).values
+        
+        # 2. Scale
+        scale = (bmax - bmin) / 15.0
+        # mask zero scale
+        mask = (scale == 0)
+        scale[mask] = 1.0 
+        inv_scale = 1.0 / scale
+        inv_scale[mask] = 0.0 
+        
+        # 3. Quantize
+        # vals = (x - min) * inv_scale
+        vals = (tensor - bmin.unsqueeze(1)) * inv_scale.unsqueeze(1)
+        vals = vals.round_().clamp_(0, 15).to(torch.uint8)
+        
+        # 4. Pack
+        # 0::2 and 1::2
+        low = vals[:, 0::2]
+        high = vals[:, 1::2]
+        packed_data = (low | (high << 4))
+        
+        # 5. Header (Scale + Min)
+        # Convert scale/min to FP16 
+        # We assume little-endian packing.
+        # Use torch.view to treat float16 as uint8 bytes
+        scale_bytes = scale.to(torch.float16).contiguous().view(torch.uint8)
+        min_bytes = bmin.to(torch.float16).contiguous().view(torch.uint8)
+        
+        # Concatenate: [Scale(2), Min(2), Data(32)] per block
+        # scale_bytes is [N_BLOCKS, 2]
+        # min_bytes is [N_BLOCKS, 2]
+        # packed_data is [N_BLOCKS, 32]
+        final = torch.cat([scale_bytes, min_bytes, packed_data], dim=1)
+        
+        return final.cpu().numpy().tobytes()
 
 
 if __name__ == '__main__':
