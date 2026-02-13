@@ -529,19 +529,29 @@ class TensorLoader:
         filepath, key = self.tensors[name]
 
         if self.format == 'safetensors':
-            with safe_open(filepath, framework='numpy') as st:
-                arr = st.get_tensor(key)
+            if HAS_TORCH:
+                # Use PyTorch backend to handle bfloat16
+                with safe_open(filepath, framework='pt') as st:
+                    pt_tensor = st.get_tensor(key)
+                    # Ensure float32 (handles bf16/fp16 -> fp32 conversion)
+                    return pt_tensor.float().numpy()
+            else:
+                # Fallback to numpy (might fail for bfloat16)
+                with safe_open(filepath, framework='numpy') as st:
+                    arr = st.get_tensor(key)
         else:
             sd = torch.load(filepath, map_location='cpu', weights_only=True)
-            arr = sd[key].numpy()
+            if hasattr(sd[key], 'float'):
+               arr = sd[key].float().numpy()
+            else:
+               arr = sd[key] # already numpy or not tensor?
             del sd
 
-        # Convert to float32
-        if arr.dtype == np.float16:
-            arr = arr.astype(np.float32)
-        elif hasattr(np, 'bfloat16') or str(arr.dtype) == 'bfloat16':
-            # bfloat16 → float32
-            arr = arr.astype(np.float32)
+        # Convert to float32 (if using numpy backend or pytorch load fallback)
+        if hasattr(arr, 'dtype'):
+            if arr.dtype == np.float16:
+                arr = arr.astype(np.float32)
+            # numpy < 2.0 doesn't have bfloat16, generally handled by torch path above
 
         return arr.astype(np.float32)
 
