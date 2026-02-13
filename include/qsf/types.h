@@ -135,22 +135,29 @@ typedef enum {
     QSF_TENSOR_FUSED_QKV    = 18,
     QSF_TENSOR_FUSED_QKV_BIAS = 19,
     QSF_TENSOR_POS_EMBED    = 20,
-    /* MoE tensors — IDs encode expert index:
-     *   tensor_type = MOE_GATE + expert_id * 3  (gate of expert N)
-     *   tensor_type = MOE_UP   + expert_id * 3  (up   of expert N)
-     *   tensor_type = MOE_DOWN + expert_id * 3  (down of expert N)
-     * The router is always a single tensor.  */
-    QSF_TENSOR_MOE_ROUTER   = 21,
-    QSF_TENSOR_MOE_GATE_0   = 22,  /* first expert gate — +3 per expert */
-    QSF_TENSOR_MOE_UP_0     = 23,  /* first expert up   — +3 per expert */
-    QSF_TENSOR_MOE_DOWN_0   = 24,  /* first expert down — +3 per expert */
-    /* Expert N: gate = 22+3*N, up = 23+3*N, down = 24+3*N */
+    /* MoE tensors — IDs encode expert index (stride 6):
+     *   GATE(e) = GATE_0 + e*6
+     *   GATE_BIAS(e) = GATE_BIAS_0 + e*6
+     *   ...
+     */
+    QSF_TENSOR_MOE_ROUTER      = 21,
+    QSF_TENSOR_MOE_ROUTER_BIAS = 22,
+    QSF_TENSOR_MOE_GATE_0      = 23,
+    QSF_TENSOR_MOE_GATE_BIAS_0 = 24,
+    QSF_TENSOR_MOE_UP_0        = 25,
+    QSF_TENSOR_MOE_UP_BIAS_0   = 26,
+    QSF_TENSOR_MOE_DOWN_0      = 27,
+    QSF_TENSOR_MOE_DOWN_BIAS_0 = 28,
 } QSFTensorType;
 
 /* Helper macros for MoE expert tensor IDs */
-#define QSF_MOE_GATE(expert)  (QSF_TENSOR_MOE_GATE_0 + (expert) * 3)
-#define QSF_MOE_UP(expert)    (QSF_TENSOR_MOE_UP_0   + (expert) * 3)
-#define QSF_MOE_DOWN(expert)  (QSF_TENSOR_MOE_DOWN_0 + (expert) * 3)
+#define QSF_MOE_STRIDE 6
+#define QSF_MOE_GATE(e)       (QSF_TENSOR_MOE_GATE_0      + (e) * QSF_MOE_STRIDE)
+#define QSF_MOE_GATE_BIAS(e)  (QSF_TENSOR_MOE_GATE_BIAS_0 + (e) * QSF_MOE_STRIDE)
+#define QSF_MOE_UP(e)         (QSF_TENSOR_MOE_UP_0        + (e) * QSF_MOE_STRIDE)
+#define QSF_MOE_UP_BIAS(e)    (QSF_TENSOR_MOE_UP_BIAS_0   + (e) * QSF_MOE_STRIDE)
+#define QSF_MOE_DOWN(e)       (QSF_TENSOR_MOE_DOWN_0      + (e) * QSF_MOE_STRIDE)
+#define QSF_MOE_DOWN_BIAS(e)  (QSF_TENSOR_MOE_DOWN_BIAS_0 + (e) * QSF_MOE_STRIDE)
 
 /* ── Tokenizer Type ──────────────────────────────────────────────── */
 typedef enum {

@@ -932,6 +932,16 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
                                  ? layer_qt : th.quant_type;
                     get_matvec_fn(k, qt)(tensor_data, engine->expert_out,
                         engine->expert_scratch, th.rows, th.cols, bs);
+                    
+                    /* Bias (optional, FP16) */
+                    void* bias_data = find_tensor(layer_data, nt,
+                        (QSFTensorType)QSF_MOE_GATE_BIAS(eidx), &th);
+                    if (bias_data) {
+                        uint16_t* b16 = (uint16_t*)bias_data;
+                        for (uint32_t i = 0; i < th.rows; i++) {
+                            engine->expert_scratch[i] += qsf_fp16_to_fp32(b16[i]);
+                        }
+                    }
                 }
 
                 /* Expert up projection: normed_x → expert_scratch2 */
@@ -942,6 +952,16 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
                                  ? layer_qt : th.quant_type;
                     get_matvec_fn(k, qt)(tensor_data, engine->expert_out,
                         engine->expert_scratch2, th.rows, th.cols, bs);
+                    
+                    /* Bias (optional, FP16) */
+                    void* bias_data = find_tensor(layer_data, nt,
+                        (QSFTensorType)QSF_MOE_UP_BIAS(eidx), &th);
+                    if (bias_data) {
+                        uint16_t* b16 = (uint16_t*)bias_data;
+                        for (uint32_t i = 0; i < th.rows; i++) {
+                            engine->expert_scratch2[i] += qsf_fp16_to_fp32(b16[i]);
+                        }
+                    }
                 }
 
                 /* Activation on gate (SiLU for Mixtral/LLaMA-family) */
@@ -958,9 +978,7 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
                 k->vec_mul(engine->expert_scratch, engine->expert_scratch2,
                            engine->expert_scratch, (int)eid);
 
-                /* Expert down projection: expert_scratch → scratch
-                 * (scratch is id-sized, guaranteed >= hd; not used
-                 *  by dense FFN path since we're in MoE branch) */
+                /* Expert down projection: expert_scratch → scratch */
                 tensor_data = find_tensor(layer_data, nt,
                     (QSFTensorType)QSF_MOE_DOWN(eidx), &th);
                 if (tensor_data) {
@@ -968,6 +986,16 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
                                  ? layer_qt : th.quant_type;
                     get_matvec_fn(k, qt)(tensor_data, engine->expert_scratch,
                         engine->scratch, th.rows, th.cols, bs);
+                    
+                    /* Bias (optional, FP16) */
+                    void* bias_data = find_tensor(layer_data, nt,
+                        (QSFTensorType)QSF_MOE_DOWN_BIAS(eidx), &th);
+                    if (bias_data) {
+                        uint16_t* b16 = (uint16_t*)bias_data;
+                        for (uint32_t i = 0; i < th.rows; i++) {
+                            engine->scratch[i] += qsf_fp16_to_fp32(b16[i]);
+                        }
+                    }
                 }
 
                 /* Weighted accumulate: x += weight * expert_output */

@@ -106,14 +106,26 @@ TENSOR_FFN_DOWN_BIAS = 17
 TENSOR_FUSED_QKV     = 18
 TENSOR_FUSED_QKV_BIAS = 19
 TENSOR_POS_EMBED     = 20
-TENSOR_MOE_ROUTER    = 21
-TENSOR_MOE_GATE_0    = 22   # +3 per expert
-TENSOR_MOE_UP_0      = 23   # +3 per expert
-TENSOR_MOE_DOWN_0    = 24   # +3 per expert
+TENSOR_MOE_ROUTER      = 21
+TENSOR_MOE_ROUTER_BIAS = 22
+TENSOR_MOE_GATE_0      = 23
+TENSOR_MOE_GATE_BIAS_0 = 24
+TENSOR_MOE_UP_0        = 25
+TENSOR_MOE_UP_BIAS_0   = 26
+TENSOR_MOE_DOWN_0      = 27
+TENSOR_MOE_DOWN_BIAS_0 = 28
 
-def moe_gate_id(expert): return TENSOR_MOE_GATE_0 + expert * 3
-def moe_up_id(expert):   return TENSOR_MOE_UP_0   + expert * 3
-def moe_down_id(expert): return TENSOR_MOE_DOWN_0 + expert * 3
+def moe_gate_id(e, bias=False):
+    base = TENSOR_MOE_GATE_BIAS_0 if bias else TENSOR_MOE_GATE_0
+    return base + e * 6
+
+def moe_up_id(e, bias=False):
+    base = TENSOR_MOE_UP_BIAS_0 if bias else TENSOR_MOE_UP_0
+    return base + e * 6
+
+def moe_down_id(e, bias=False):
+    base = TENSOR_MOE_DOWN_BIAS_0 if bias else TENSOR_MOE_DOWN_0
+    return base + e * 6
 
 
 ###############################################################################
@@ -416,7 +428,10 @@ def get_tensor_mapping(arch: str, num_layers: int,
             mapping[f'{p}.block_sparse_moe.gate.weight'] = ('moe_router_w', L)
             # DeepSeek/Qwen: mlp.gate
             mapping[f'{p}.mlp.gate.weight'] = ('moe_router_w', L)
-            # GPT-OSS: block_sparse_layer.gate?
+            # GPT-OSS: mlp.router
+            mapping[f'{p}.mlp.router.weight'] = ('moe_router_w', L)
+            mapping[f'{p}.mlp.router.bias']   = ('moe_router_b', L)
+            # GPT-OSS old?: block_sparse_layer.gate?
             mapping[f'{p}.block_sparse_layer.gate.weight'] = ('moe_router_w', L)
 
             # 3. Experts - Try common names
@@ -437,11 +452,19 @@ def get_tensor_mapping(arch: str, num_layers: int,
                     mapping[f'{ep}.w1.weight'] = (f'moe_gate_w_{e}', L)
                     mapping[f'{ep}.w3.weight'] = (f'moe_up_w_{e}', L)
                     mapping[f'{ep}.w2.weight'] = (f'moe_down_w_{e}', L)
+                    # Biases (rare for Mixtral but possible)
+                    mapping[f'{ep}.w1.bias'] = (f'moe_gate_b_{e}', L)
+                    mapping[f'{ep}.w3.bias'] = (f'moe_up_b_{e}', L)
+                    mapping[f'{ep}.w2.bias'] = (f'moe_down_b_{e}', L)
                     
                     # Pattern B: gate_proj, up_proj, down_proj - LLaMA style
                     mapping[f'{ep}.gate_proj.weight'] = (f'moe_gate_w_{e}', L)
                     mapping[f'{ep}.up_proj.weight']   = (f'moe_up_w_{e}', L)
                     mapping[f'{ep}.down_proj.weight'] = (f'moe_down_w_{e}', L)
+                    # Biases (GPT-OSS uses these)
+                    mapping[f'{ep}.gate_proj.bias'] = (f'moe_gate_b_{e}', L)
+                    mapping[f'{ep}.up_proj.bias']   = (f'moe_up_b_{e}', L)
+                    mapping[f'{ep}.down_proj.bias'] = (f'moe_down_b_{e}', L)
 
 
     return mapping
@@ -943,10 +966,19 @@ class QSFWriter:
         # Add per-expert MoE tensor IDs dynamically
         num_experts = cfg.get('num_local_experts',
                        cfg.get('n_routed_experts', 0))
+        # Router
+        role_to_type['moe_router_w'] = TENSOR_MOE_ROUTER
+        role_to_type['moe_router_b'] = TENSOR_MOE_ROUTER_BIAS
+        
         for e in range(num_experts):
+            # Weights
             role_to_type[f'moe_gate_w_{e}'] = moe_gate_id(e)
             role_to_type[f'moe_up_w_{e}']   = moe_up_id(e)
             role_to_type[f'moe_down_w_{e}'] = moe_down_id(e)
+            # Biases
+            role_to_type[f'moe_gate_b_{e}'] = moe_gate_id(e, bias=True)
+            role_to_type[f'moe_up_b_{e}']   = moe_up_id(e, bias=True)
+            role_to_type[f'moe_down_b_{e}'] = moe_down_id(e, bias=True)
 
         num_tensors = 0
         layer_buf = bytearray()
@@ -968,8 +1000,9 @@ class QSFWriter:
                                             'ffn_up_w', 'ffn_down_w'):
                 tensor = tensor.T.copy()
 
-            # Choose quantizer: norms stay in FP16, weights get quantized
-            if role in ('attn_norm_w', 'attn_norm_b', 'ffn_norm_w', 'ffn_norm_b'):
+            # Choose quantizer: norms and biases stay in FP16, weights get quantized
+            if role in ('attn_norm_w', 'attn_norm_b', 'ffn_norm_w', 'ffn_norm_b') or \
+               'bias' in role or role.endswith('_b'):
                 q = self.norm_quantizer
                 qt = QUANT_FP16
             else:
@@ -1080,6 +1113,64 @@ class GptOssLoader(TensorLoader):
         super().__init__(model_dir)
         self.num_experts = num_experts
 
+    def keys(self):
+        # Yield physical keys AND virtual keys for experts
+        for name in super().keys():
+            yield name
+            
+            # Use 'gate_up_proj_blocks' as triggers for virtual keys
+            # Name: model.layers.{L}.mlp.experts.gate_up_proj_blocks
+            if 'mlp.experts.gate_up_proj_blocks' in name:
+                # Extract layer index
+                try:
+                    parts = name.split('.')
+                    # model.layers.0.mlp...
+                    l_idx = int(parts[2])
+                    prefix = f'model.layers.{l_idx}.mlp.experts'
+                    
+                    for e in range(self.num_experts):
+                        ep = f'{prefix}.{e}'
+                        yield f'{ep}.gate_proj.weight'
+                        yield f'{ep}.up_proj.weight'
+                        # Weights derived from blocks/scales, but we yield .weight key
+                except:
+                    pass
+
+            # Triggers for biases
+            if 'mlp.experts.gate_up_proj_bias' in name:
+                try:
+                    parts = name.split('.')
+                    l_idx = int(parts[2])
+                    prefix = f'model.layers.{l_idx}.mlp.experts'
+                    for e in range(self.num_experts):
+                        ep = f'{prefix}.{e}'
+                        yield f'{ep}.gate_proj.bias'
+                        yield f'{ep}.up_proj.bias'
+                except:
+                    pass
+
+            if 'mlp.experts.down_proj_blocks' in name:
+                try:
+                    parts = name.split('.')
+                    l_idx = int(parts[2])
+                    prefix = f'model.layers.{l_idx}.mlp.experts'
+                    for e in range(self.num_experts):
+                        ep = f'{prefix}.{e}'
+                        yield f'{ep}.down_proj.weight'
+                except:
+                    pass
+
+            if 'mlp.experts.down_proj_bias' in name:
+                try:
+                    parts = name.split('.')
+                    l_idx = int(parts[2])
+                    prefix = f'model.layers.{l_idx}.mlp.experts'
+                    for e in range(self.num_experts):
+                        ep = f'{prefix}.{e}'
+                        yield f'{ep}.down_proj.bias'
+                except:
+                    pass
+
     def get_tensor(self, name):
         # 1. Check if it's a virtual expert tensor
         # Pattern: model.layers.L.block_sparse_layer.experts.E.ROLE.weight
@@ -1090,13 +1181,16 @@ class GptOssLoader(TensorLoader):
         # The mapping in get_tensor_mapping produces names like:
         # model.layers.0.block_sparse_layer.experts.0.gate.weight
         
-        if 'experts' in name and 'weight' in name:
-            return self._load_virtual_expert(name)
+        if 'experts' in name:
+            if 'weight' in name:
+                return self._load_virtual_expert_weight(name)
+            elif 'bias' in name:
+                return self._load_virtual_expert_bias(name)
         
         # 2. Standard tensor
         return super().get_tensor(name)
 
-    def _load_virtual_expert(self, name):
+    def _load_virtual_expert_weight(self, name):
         # Parse name: model.layers.{L}.block_sparse_layer.experts.{E}.{role}.weight
         try:
             parts = name.split('.')
@@ -1159,6 +1253,48 @@ class GptOssLoader(TensorLoader):
                 return data[split:]
         else:
             return data
+
+    def _load_virtual_expert_bias(self, name):
+        # Parse name: model.layers.{L}.block_sparse_layer.experts.{E}.{role}.bias
+        try:
+            parts = name.split('.')
+            l_idx = int(parts[2])
+            e_idx = int(parts[5])
+            role = parts[6]
+        except:
+            return super().get_tensor(name)
+
+        prefix = f'model.layers.{l_idx}.mlp.experts'
+        
+        if role in ('gate', 'up', 'w1', 'w3', 'gate_proj', 'up_proj'):
+            base = f'{prefix}.gate_up_proj_bias'
+            is_gate_up = True
+        elif role in ('down', 'w2', 'down_proj'):
+            base = f'{prefix}.down_proj_bias'
+            is_gate_up = False
+        else:
+            return super().get_tensor(name)
+
+        # Load physical stacked bias
+        # Shape: [NUM_EXPERTS, ROWS]
+        physical_bias = super().get_tensor(base)
+        if physical_bias is None:
+            return None
+
+        # 1. Extract expert slice
+        # Shape: [ROWS]
+        exp_bias = physical_bias[e_idx]
+
+        # 2. Split if gate_up
+        if is_gate_up:
+            rows = exp_bias.shape[0]
+            split = rows // 2
+            if role in ('gate', 'w1', 'gate_proj'):
+                return exp_bias[:split]
+            else:
+                return exp_bias[split:]
+        else:
+            return exp_bias
 
     def _dequant_mxfp4(self, blocks, scales):
         # blocks: [ROWS, N_BLOCKS, 16], uint8
