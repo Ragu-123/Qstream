@@ -40,6 +40,13 @@ try:
 except ImportError:
     HAS_LZ4 = False
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
+
+from functools import lru_cache
+
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 log = logging.getLogger('convert_hf')
 
@@ -738,8 +745,8 @@ class QSFWriter:
 
             # ── 4. Write each layer ──
             mapping = get_tensor_mapping(arch, num_layers, cfg)
-            for layer_idx in range(num_layers):
-                log.info(f"  Layer {layer_idx}/{num_layers-1}")
+            for layer_idx in tqdm(range(num_layers), desc="Converting layers"):
+                # log.info(f"  Layer {layer_idx}/{num_layers-1}")
                 entry = self._write_layer(f, loader, mapping,
                                           layer_idx, arch, cfg)
                 layer_entries.append(entry)
@@ -1203,6 +1210,11 @@ class GptOssLoader(TensorLoader):
                 except:
                     pass
 
+    @lru_cache(maxsize=8)
+    def _get_cached_tensor(self, name):
+        """Cache loaded tensors to avoid re-reading massive stacked tensors."""
+        return super().get_tensor(name)
+
     def get_tensor(self, name):
         # 1. Check if it's a virtual expert tensor
         # Pattern: model.layers.L.block_sparse_layer.experts.E.ROLE.weight
@@ -1247,9 +1259,10 @@ class GptOssLoader(TensorLoader):
         else:
             return super().get_tensor(name)
 
-        # Load blocks and scales
-        blocks = super().get_tensor(f'{base}_blocks')
-        scales = super().get_tensor(f'{base}_scales')
+        # Load blocks and scales (physically stacked)
+        # Use cached loader to avoid re-reading 2GB tensor 32 times
+        blocks = self._get_cached_tensor(f'{base}_blocks')
+        scales = self._get_cached_tensor(f'{base}_scales')
         
         if blocks is None or scales is None:
             # Maybe not quantized? Try loading raw weight
@@ -1316,7 +1329,7 @@ class GptOssLoader(TensorLoader):
 
         # Load physical stacked bias
         # Shape: [NUM_EXPERTS, ROWS]
-        physical_bias = super().get_tensor(base)
+        physical_bias = self._get_cached_tensor(base)
         if physical_bias is None:
             return None
 
