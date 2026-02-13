@@ -530,30 +530,34 @@ class TensorLoader:
 
         if self.format == 'safetensors':
             if HAS_TORCH:
-                # Use PyTorch backend to handle bfloat16
+                # Use PyTorch backend to handle bfloat16 and preserve int types
                 with safe_open(filepath, framework='pt') as st:
                     pt_tensor = st.get_tensor(key)
-                    # Ensure float32 (handles bf16/fp16 -> fp32 conversion)
-                    return pt_tensor.float().numpy()
+                    if pt_tensor.is_floating_point():
+                        return pt_tensor.float().numpy()
+                    else:
+                        return pt_tensor.numpy()
             else:
-                # Fallback to numpy (might fail for bfloat16)
+                # Fallback to numpy
                 with safe_open(filepath, framework='numpy') as st:
                     arr = st.get_tensor(key)
         else:
             sd = torch.load(filepath, map_location='cpu', weights_only=True)
-            if hasattr(sd[key], 'float'):
-               arr = sd[key].float().numpy()
+            t = sd[key]
+            if hasattr(t, 'is_floating_point') and t.is_floating_point():
+               arr = t.float().numpy()
+            elif hasattr(t, 'numpy'):
+               arr = t.numpy()
             else:
-               arr = sd[key] # already numpy or not tensor?
+               arr = t
             del sd
 
-        # Convert to float32 (if using numpy backend or pytorch load fallback)
-        if hasattr(arr, 'dtype'):
-            if arr.dtype == np.float16:
-                arr = arr.astype(np.float32)
-            # numpy < 2.0 doesn't have bfloat16, generally handled by torch path above
+        # Convert float16/bfloat16 to float32 (if numpy)
+        if hasattr(arr, 'dtype') and arr.dtype.kind == 'f':
+             if arr.dtype == np.float16 or str(arr.dtype) == 'bfloat16':
+                 arr = arr.astype(np.float32)
 
-        return arr.astype(np.float32)
+        return arr
 
     def has_tensor(self, name: str) -> bool:
         return name in self.tensors
