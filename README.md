@@ -259,6 +259,4 @@ The QSF (Quantized Stream Format) is a custom binary format optimized for stream
 
 Each layer is self-contained and can be loaded/decompressed independently, enabling streaming inference with minimal RAM.
 
-## License
 
-[Insert License Here]
