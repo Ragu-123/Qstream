@@ -72,14 +72,17 @@ QSFError qsf_budget_compute(QSFBudget* budget, const QSFHeader* h,
     budget->activation_size = activation;
     budget->scratch_size = scratch;
 
-    /* Priority 2: KV cache */
+    /* Priority 2: KV cache
+     * We use int8 quantized KV cache: 1 byte per element + 1 float scale
+     * per position per head. This cuts KV memory by ~4x vs float32.
+     * Actual per-position cost: nkv * head_d * 1 (int8) + nkv * 4 (scale)
+     * for both K and V = 2 * (nkv * head_d + nkv * 4) per position per layer */
     size_t remaining = ram_budget - p1;
-    size_t kv_per_pos_per_layer = 2 * nkv * head_d;  /* 4-bit: /2 */
+    size_t kv_per_pos_per_layer = 2 * (nkv * head_d * 1 + nkv * 4);  /* int8 data + scales */
 
-    /* Try different configs */
-    int kv_bits_options[] = {4, 4, 4, 2, 2};
-    int kv_seq_options[]  = {2048, 1024, 512, 1024, 256};
-    int num_configs = 5;
+    /* Try different sequence length configs */
+    int kv_seq_options[] = {4096, 2048, 1024, 512, 256, 128};
+    int num_configs = 6;
     int chosen = -1;
 
     for (int c = 0; c < num_configs; c++) {
@@ -87,30 +90,27 @@ QSFError qsf_budget_compute(QSFBudget* budget, const QSFHeader* h,
         if (h->max_seq_len > 0 && win > (int)h->max_seq_len)
             win = (int)h->max_seq_len;
 
-        size_t bytes_per_elem = (kv_bits_options[c] == 4) ? 1 : 1; /* packed */
-        size_t kv_cost = (size_t)win * nl * kv_per_pos_per_layer * bytes_per_elem / 2;
-        /* Add scales: one float per position per head per K/V */
-        kv_cost += (size_t)win * nl * nkv * 2 * 4;
-        /* Attention scores buffer */
-        size_t attn_score = nh * win * 4;
+        size_t kv_cost = (size_t)win * nl * kv_per_pos_per_layer;
+        /* Attention scores buffer (float32 per head per position) */
+        size_t attn_score = (size_t)nh * win * 4;
         kv_cost += attn_score;
 
         if (kv_cost < remaining * 85 / 100) {
             budget->kv_cache_size = kv_cost;
             budget->kv_max_seq    = win;
-            budget->kv_quant_bits = kv_bits_options[c];
+            budget->kv_quant_bits = 8;  /* int8 quantized KV */
             chosen = c;
             break;
         }
     }
 
     if (chosen < 0) {
-        /* Absolute minimum: 128 sequence length, 4-bit */
-        budget->kv_max_seq = 128;
-        budget->kv_quant_bits = 4;
-        budget->kv_cache_size = (size_t)128 * nl * kv_per_pos_per_layer / 2 +
-                                (size_t)128 * nl * nkv * 2 * 4 +
-                                nh * 128 * 4;
+        /* Absolute minimum: 128 sequence length */
+        int win = 128;
+        budget->kv_max_seq = win;
+        budget->kv_quant_bits = 8;
+        budget->kv_cache_size = (size_t)win * nl * kv_per_pos_per_layer +
+                                (size_t)nh * win * 4;
     }
 
     remaining = ram_budget - p1 - budget->kv_cache_size;
@@ -137,31 +137,35 @@ QSFError qsf_budget_compute(QSFBudget* budget, const QSFHeader* h,
 }
 
 /* ── Helper: get matvec function for a quant type ────────────────── */
+
 static qsf_matvec_fn get_matvec_fn(const QSFKernelTable* kt, uint8_t qt) {
     switch (qt) {
         case QSF_QUANT_2BIT_ASYM:
-        case QSF_QUANT_2BIT_SYM:  return kt->matvec_2bit;
-        case QSF_QUANT_3BIT_ASYM: return kt->matvec_3bit;
-        case QSF_QUANT_4BIT_SYM:  return kt->matvec_4bit_sym;
+        case QSF_QUANT_2BIT_SYM:     return kt->matvec_2bit;
+        case QSF_QUANT_3BIT_ASYM:    return kt->matvec_3bit;
+        case QSF_QUANT_4BIT_SYM:     return kt->matvec_4bit_sym;
+        case QSF_QUANT_2BIT_OUTLIER: return kt->matvec_outlier_2bit;
+        case QSF_QUANT_4BIT_OUTLIER: return kt->matvec_outlier_4bit;
         case QSF_QUANT_4BIT_ASYM:
-        default:                  return kt->matvec_4bit;
+        default:                     return kt->matvec_4bit;
     }
 }
 
-/* Check if quant type is outlier-aware (needs special matvec) */
+/* Check if quant type is outlier-aware */
 static int is_outlier_quant(uint8_t qt) {
     return qt == QSF_QUANT_2BIT_OUTLIER || qt == QSF_QUANT_4BIT_OUTLIER;
 }
 
-/* Outlier-aware matvec dispatch */
+/* Outlier-aware matvec dispatch (legacy, kept for compatibility) */
 static void matvec_outlier(uint8_t qt, const void* data, size_t data_size,
                             const float* input, float* output,
                             int rows, int cols, int block_size) {
+    (void)data_size;
     if (qt == QSF_QUANT_2BIT_OUTLIER) {
-        qsf_matvec_outlier_2bit(data, data_size, input, output,
+        qsf_matvec_outlier_2bit(data, 0, input, output,
                                   rows, cols, block_size);
     } else {
-        qsf_matvec_outlier_4bit(data, data_size, input, output,
+        qsf_matvec_outlier_4bit(data, 0, input, output,
                                   rows, cols, block_size);
     }
 }
@@ -171,11 +175,8 @@ static void do_matvec(const QSFKernelTable* kt, uint8_t qt,
                        const void* data, size_t data_size,
                        const float* input, float* output,
                        int rows, int cols, int bs) {
-    if (is_outlier_quant(qt)) {
-        matvec_outlier(qt, data, data_size, input, output, rows, cols, bs);
-    } else {
-        get_matvec_fn(kt, qt)(data, input, output, rows, cols, bs);
-    }
+    (void)data_size;
+    get_matvec_fn(kt, qt)(data, input, output, rows, cols, bs);
 }
 
 /* ── Helper: find tensor in decompressed layer data ──────────────── */
@@ -232,7 +233,10 @@ static void apply_rope(float* q, float* k, int head_dim, int position,
     }
 }
 
-/* ── Helper: KV cache store (simple float storage for now) ───────── */
+/* ── Helper: KV cache store (int8 quantized) ──────────────────────
+ * Stores K/V vectors as int8 with per-position absmax scale.
+ * Reduces KV memory by 4x vs float32 with minimal quality loss
+ * (attention is dominated by relative magnitudes, not absolute precision). */
 static void kv_cache_store(QSFKVCache* kv, int layer, int position,
                            const float* k_vec, const float* v_vec) {
     int hd = kv->head_dim;
@@ -242,19 +246,53 @@ static void kv_cache_store(QSFKVCache* kv, int layer, int position,
         int head_idx = layer * nkv + h;
         QSFKVHead* head = &kv->heads[head_idx];
 
-        /* Store K */
-        float* k_dst = (float*)head->k_cache + position * hd;
-        memcpy(k_dst, k_vec + h * hd, hd * sizeof(float));
-        head->k_scales[position] = 1.0f;
+        /* Quantize K to int8: find absmax, scale to [-127, 127] */
+        const float* k_src = k_vec + h * hd;
+        int8_t* k_dst = (int8_t*)head->k_cache + position * hd;
+        float k_absmax = 0.0f;
+        for (int i = 0; i < hd; i++) {
+            float a = k_src[i] < 0 ? -k_src[i] : k_src[i];
+            if (a > k_absmax) k_absmax = a;
+        }
+        float k_scale = k_absmax / 127.0f;
+        head->k_scales[position] = k_scale;
+        if (k_absmax > 1e-30f) {
+            float k_inv_scale = 127.0f / k_absmax;
+            for (int i = 0; i < hd; i++) {
+                float v = k_src[i] * k_inv_scale;
+                if (v > 127.0f) v = 127.0f;
+                if (v < -127.0f) v = -127.0f;
+                k_dst[i] = (int8_t)(v + (v >= 0 ? 0.5f : -0.5f));
+            }
+        } else {
+            memset(k_dst, 0, hd * sizeof(int8_t));
+        }
 
-        /* Store V */
-        float* v_dst = (float*)head->v_cache + position * hd;
-        memcpy(v_dst, v_vec + h * hd, hd * sizeof(float));
-        head->v_scales[position] = 1.0f;
+        /* Quantize V to int8 */
+        const float* v_src = v_vec + h * hd;
+        int8_t* v_dst = (int8_t*)head->v_cache + position * hd;
+        float v_absmax = 0.0f;
+        for (int i = 0; i < hd; i++) {
+            float a = v_src[i] < 0 ? -v_src[i] : v_src[i];
+            if (a > v_absmax) v_absmax = a;
+        }
+        float v_scale = v_absmax / 127.0f;
+        head->v_scales[position] = v_scale;
+        if (v_absmax > 1e-30f) {
+            float v_inv_scale = 127.0f / v_absmax;
+            for (int i = 0; i < hd; i++) {
+                float val = v_src[i] * v_inv_scale;
+                if (val > 127.0f) val = 127.0f;
+                if (val < -127.0f) val = -127.0f;
+                v_dst[i] = (int8_t)(val + (val >= 0 ? 0.5f : -0.5f));
+            }
+        } else {
+            memset(v_dst, 0, hd * sizeof(int8_t));
+        }
     }
 }
 
-/* ── Allocate KV cache ───────────────────────────────────────────── */
+/* ── Allocate KV cache (int8 quantized) ─────────────────────────── */
 static QSFError alloc_kv_cache(QSFKVCache* kv, Arena* arena,
                                 int num_layers, int num_kv_heads,
                                 int head_dim, int max_seq) {
@@ -270,10 +308,12 @@ static QSFError alloc_kv_cache(QSFKVCache* kv, Arena* arena,
     if (!kv->heads) return QSF_ERR_OUT_OF_MEMORY;
 
     for (int i = 0; i < total_heads; i++) {
-        kv->heads[i].k_cache = arena_alloc(arena, max_seq * head_dim * sizeof(float),
+        /* int8 storage: 1 byte per element */
+        kv->heads[i].k_cache = arena_alloc(arena, max_seq * head_dim * sizeof(int8_t),
                                             64, "k_cache");
-        kv->heads[i].v_cache = arena_alloc(arena, max_seq * head_dim * sizeof(float),
+        kv->heads[i].v_cache = arena_alloc(arena, max_seq * head_dim * sizeof(int8_t),
                                             64, "v_cache");
+        /* Per-position scale factors for dequantization */
         kv->heads[i].k_scales = (float*)arena_alloc(arena, max_seq * sizeof(float),
                                                       64, "k_scales");
         kv->heads[i].v_scales = (float*)arena_alloc(arena, max_seq * sizeof(float),
@@ -419,16 +459,31 @@ QSFError qsf_engine_create(QSFEngine* engine, const char* model_path,
                 engine->model.num_kv_heads, h->vocab_size);
     }
 
-    /* Compute budget */
+    /* Compute budget — model data is mmap'd so we only need RAM for
+     * working buffers (activations, scratch, logits) + KV cache + norms.
+     * Use total_ram * 0.75 as default since mmap doesn't consume RSS
+     * until pages are accessed (and we only touch one layer at a time). */
     size_t budget_bytes = cfg->ram_budget;
     if (budget_bytes == 0) {
+        uint64_t total = engine->platform.total_ram_bytes;
         uint64_t avail = engine->platform.available_ram_bytes;
-        if (avail == 0) avail = 200ULL * 1024 * 1024;
-        budget_bytes = (size_t)(avail / 2);
-        if (budget_bytes > 200ULL * 1024 * 1024)
-            budget_bytes = 200ULL * 1024 * 1024;
-        if (budget_bytes < 64ULL * 1024 * 1024)
-            budget_bytes = 64ULL * 1024 * 1024;
+        if (total == 0) total = 4ULL * 1024 * 1024 * 1024;  /* 4GB fallback */
+
+        /* Use 75% of total RAM (model is mmap'd, not loaded to RAM) */
+        budget_bytes = (size_t)(total * 75 / 100);
+
+        /* But don't exceed available RAM minus a safety margin */
+        if (avail > 0) {
+            size_t avail_budget = (size_t)(avail * 85 / 100);
+            if (avail_budget < budget_bytes)
+                budget_bytes = avail_budget;
+        }
+
+        /* Reasonable bounds */
+        if (budget_bytes > 8ULL * 1024 * 1024 * 1024)
+            budget_bytes = 8ULL * 1024 * 1024 * 1024;  /* 8GB max */
+        if (budget_bytes < 128ULL * 1024 * 1024)
+            budget_bytes = 128ULL * 1024 * 1024;  /* 128MB min */
     }
 
     err = qsf_budget_compute(&engine->budget, h,
@@ -678,23 +733,30 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
                                                     token_offset, emb_quant_bytes);
             if (emb_data) {
                 /* Dequantize embedding into activation buffer */
-                int num_blocks = (hd + bs - 1) / bs;
-                size_t blk_sz = qsf_quant_block_size(
-                    (QSFQuantType)eh.quant_type, bs);
-                const uint8_t* bp = (const uint8_t*)emb_data;
-                for (int b = 0; b < num_blocks; b++) {
-                    int count = (b + 1 < num_blocks) ? (int)bs : (int)(hd - b * bs);
-                    switch (eh.quant_type) {
-                        case QSF_QUANT_2BIT_ASYM:
-                            qsf_dequant_block_2bit(bp, x + b * bs, count); break;
-                        case QSF_QUANT_4BIT_ASYM:
-                            qsf_dequant_block_4bit(bp, x + b * bs, count); break;
-                        case QSF_QUANT_4BIT_SYM:
-                            qsf_dequant_block_4bit_sym(bp, x + b * bs, count); break;
-                        default:
-                            qsf_dequant_block_4bit(bp, x + b * bs, count); break;
+                if (eh.quant_type == QSF_QUANT_FP16) {
+                    /* FP16 embeddings: direct conversion */
+                    qsf_fp16_to_fp32_array((const uint16_t*)emb_data, x, hd);
+                } else {
+                    int num_blocks = (hd + bs - 1) / bs;
+                    size_t blk_sz = qsf_quant_block_size(
+                        (QSFQuantType)eh.quant_type, bs);
+                    const uint8_t* bp = (const uint8_t*)emb_data;
+                    for (int b = 0; b < num_blocks; b++) {
+                        int count = (b + 1 < num_blocks) ? (int)bs : (int)(hd - b * bs);
+                        switch (eh.quant_type) {
+                            case QSF_QUANT_2BIT_ASYM:
+                                qsf_dequant_block_2bit(bp, x + b * bs, count); break;
+                            case QSF_QUANT_3BIT_ASYM:
+                                qsf_dequant_block_3bit(bp, x + b * bs, count); break;
+                            case QSF_QUANT_4BIT_ASYM:
+                                qsf_dequant_block_4bit(bp, x + b * bs, count); break;
+                            case QSF_QUANT_4BIT_SYM:
+                                qsf_dequant_block_4bit_sym(bp, x + b * bs, count); break;
+                            default:
+                                qsf_dequant_block_4bit(bp, x + b * bs, count); break;
+                        }
+                        bp += blk_sz;
                     }
-                    bp += blk_sz;
                 }
             }
         }
@@ -829,23 +891,33 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
             float* scores = engine->attn_scores + head * engine->budget.kv_max_seq;
             QSFKVHead* kv = &engine->kv_cache.heads[layer * nkv + kv_head];
 
-            /* Compute Q · K^T / sqrt(d) for each position */
+            /* Compute Q · K^T / sqrt(d) for each position
+             * K is stored as int8 with per-position scale:
+             *   K_float[d] = K_int8[d] * scale */
+            float inv_sqrt_d = 1.0f / sqrtf((float)head_d);
             for (int p = 0; p < seq_len; p++) {
-                float* cached_k = (float*)kv->k_cache + p * head_d;
-                scores[p] = k->dot(q, cached_k, head_d) / sqrtf((float)head_d);
+                int8_t* cached_k = (int8_t*)kv->k_cache + p * head_d;
+                float k_scale = kv->k_scales[p];
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_d; d++) {
+                    dot += q[d] * ((float)cached_k[d] * k_scale);
+                }
+                scores[p] = dot * inv_sqrt_d;
             }
 
             /* Causal masking: positions > current are already absent */
             /* Softmax */
             k->softmax(scores, scores, seq_len);
 
-            /* Weighted sum of V */
+            /* Weighted sum of V (int8 dequantized on the fly) */
             float* out_head = engine->attn_out + head * head_d;
             for (int p = 0; p < seq_len; p++) {
-                float* cached_v = (float*)kv->v_cache + p * head_d;
+                int8_t* cached_v = (int8_t*)kv->v_cache + p * head_d;
+                float v_scale = kv->v_scales[p];
                 float score = scores[p];
+                float sv = score * v_scale;  /* combined scale */
                 for (uint32_t d = 0; d < head_d; d++) {
-                    out_head[d] += score * cached_v[d];
+                    out_head[d] += sv * (float)cached_v[d];
                 }
             }
         }
@@ -1126,7 +1198,10 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
 
     /* ─── Output projection (logits) ─────────────────────────────── */
     if (engine->model.weight_tied) {
-        /* Weight-tied: compute dot(x, embedding[v]) for each vocab entry */
+        /* Weight-tied: embedding table IS the output head.
+         * Treat it as a (vocab_size × hidden_dim) quantized matrix and do
+         * a single matvec: logits = embedding_matrix × x.
+         * The entire embedding data is contiguous in the mmap'd file. */
         const QSFHeader* hh = h;
         if (hh->embedding_offset > 0) {
             QSFEmbeddingHeader eh;
@@ -1141,34 +1216,17 @@ QSFError qsf_forward(QSFEngine* engine, uint32_t token_id, int position) {
                     sizeof(QSFEmbeddingHeader);
                 if (eh.num_chunks > 1) emb_data_offset += eh.num_chunks * 8;
 
-                float* emb_row = engine->scratch;  /* reuse scratch as temp */
-                for (uint32_t v = 0; v < hh->vocab_size; v++) {
-                    size_t tok_off = emb_data_offset + v * emb_quant_bytes;
-                    const void* emb_data = file_access_get(&engine->model.file,
-                        tok_off, emb_quant_bytes);
-                    if (emb_data) {
-                        int num_blocks = (hd + bs - 1) / bs;
-                        size_t blk_sz = qsf_quant_block_size(
-                            (QSFQuantType)eh.quant_type, bs);
-                        const uint8_t* bp = (const uint8_t*)emb_data;
-                        for (int b = 0; b < num_blocks; b++) {
-                            int cnt = (b + 1 < num_blocks) ? (int)bs : (int)(hd - b * bs);
-                            switch (eh.quant_type) {
-                                case QSF_QUANT_4BIT_ASYM:
-                                    qsf_dequant_block_4bit(bp, emb_row + b*bs, cnt); break;
-                                case QSF_QUANT_4BIT_SYM:
-                                    qsf_dequant_block_4bit_sym(bp, emb_row + b*bs, cnt); break;
-                                case QSF_QUANT_2BIT_ASYM:
-                                    qsf_dequant_block_2bit(bp, emb_row + b*bs, cnt); break;
-                                default:
-                                    qsf_dequant_block_4bit(bp, emb_row + b*bs, cnt); break;
-                            }
-                            bp += blk_sz;
-                        }
-                        engine->logits[v] = k->dot(x, emb_row, hd);
-                    } else {
-                        engine->logits[v] = 0.0f;
-                    }
+                /* Get the entire embedding table as contiguous data */
+                size_t total_emb_size = (size_t)hh->vocab_size * emb_quant_bytes;
+                const void* emb_block = file_access_get(&engine->model.file,
+                    emb_data_offset, total_emb_size);
+
+                if (emb_block) {
+                    /* Single matvec: logits[vocab] = embeddings[vocab×dim] · x[dim] */
+                    qsf_matvec_fn fn = get_matvec_fn(k, eh.quant_type);
+                    fn(emb_block, x, engine->logits, hh->vocab_size, hd, bs);
+                } else {
+                    memset(engine->logits, 0, hh->vocab_size * sizeof(float));
                 }
             } else {
                 memset(engine->logits, 0, hh->vocab_size * sizeof(float));
@@ -1243,16 +1301,44 @@ QSFError qsf_engine_generate(QSFEngine* engine,
     float* logits_copy = (float*)malloc(h->vocab_size * sizeof(float));
     if (!logits_copy) return QSF_ERR_OUT_OF_MEMORY;
 
+    /* Recent token buffer for repeat penalty (last 64 tokens) */
+    #define REPEAT_WINDOW 64
+    uint32_t recent_tokens[REPEAT_WINDOW];
+    int num_recent = 0;
+
+    /* Seed with tail of prompt tokens */
+    int seed_start = (num_prompt > REPEAT_WINDOW) ? num_prompt - REPEAT_WINDOW : 0;
+    for (int i = seed_start; i < num_prompt; i++) {
+        recent_tokens[num_recent++] = prompt_tokens[i];
+    }
+
     for (int t = 0; t < max_new_tokens; t++) {
         if (engine->interrupted) break;
 
         /* Sample next token from logits (copy to preserve original) */
         memcpy(logits_copy, engine->logits, h->vocab_size * sizeof(float));
 
+        /* Apply repeat penalty before sampling */
+        if (sampling->repeat_penalty > 1.0f && num_recent > 0) {
+            qsf_apply_repeat_penalty(logits_copy, h->vocab_size,
+                                      recent_tokens, num_recent,
+                                      sampling->repeat_penalty);
+        }
+
         int next_token = qsf_sample(logits_copy, h->vocab_size, sampling, &rng);
 
         /* EOS check */
         if ((uint32_t)next_token == h->eos_token_id) break;
+
+        /* Track token for repeat penalty (circular overwrite) */
+        if (num_recent < REPEAT_WINDOW) {
+            recent_tokens[num_recent++] = (uint32_t)next_token;
+        } else {
+            /* Shift left by 1 and append */
+            memmove(recent_tokens, recent_tokens + 1,
+                    (REPEAT_WINDOW - 1) * sizeof(uint32_t));
+            recent_tokens[REPEAT_WINDOW - 1] = (uint32_t)next_token;
+        }
 
         /* Callback */
         if (callback) {
@@ -1275,6 +1361,7 @@ QSFError qsf_engine_generate(QSFEngine* engine,
         engine->kv_cache.current_seq_len = position + 1;
         position++;
     }
+    #undef REPEAT_WINDOW
 
     free(logits_copy);
     return QSF_OK;

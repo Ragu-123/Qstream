@@ -94,6 +94,8 @@ typedef struct {
     qsf_matvec_fn matvec_3bit;
     qsf_matvec_fn matvec_4bit;
     qsf_matvec_fn matvec_4bit_sym;
+    qsf_matvec_fn matvec_outlier_2bit;
+    qsf_matvec_fn matvec_outlier_4bit;
 
     /* Vector ops */
     qsf_vec_op_fn     vec_add;
@@ -180,10 +182,18 @@ void qsf_matvec_2bit_avx2(const void* QSF_RESTRICT w,
                            const float* QSF_RESTRICT in,
                            float* QSF_RESTRICT out,
                            int rows, int cols, int bs);
+void qsf_matvec_outlier_2bit_avx2(const void* QSF_RESTRICT w,
+                                   const float* QSF_RESTRICT in,
+                                   float* QSF_RESTRICT out,
+                                   int rows, int cols, int bs);
 void qsf_matvec_4bit_avx2(const void* QSF_RESTRICT w,
                            const float* QSF_RESTRICT in,
                            float* QSF_RESTRICT out,
                            int rows, int cols, int bs);
+void qsf_matvec_outlier_4bit_avx2(const void* QSF_RESTRICT w,
+                                   const float* QSF_RESTRICT in,
+                                   float* QSF_RESTRICT out,
+                                   int rows, int cols, int bs);
 void qsf_matvec_4bit_sym_avx2(const void* QSF_RESTRICT w,
                                 const float* QSF_RESTRICT in,
                                 float* QSF_RESTRICT out,
@@ -214,10 +224,18 @@ void qsf_matvec_2bit_neon(const void* QSF_RESTRICT w,
                            const float* QSF_RESTRICT in,
                            float* QSF_RESTRICT out,
                            int rows, int cols, int bs);
+void qsf_matvec_outlier_2bit_neon(const void* QSF_RESTRICT w,
+                                   const float* QSF_RESTRICT in,
+                                   float* QSF_RESTRICT out,
+                                   int rows, int cols, int bs);
 void qsf_matvec_4bit_neon(const void* QSF_RESTRICT w,
                            const float* QSF_RESTRICT in,
                            float* QSF_RESTRICT out,
                            int rows, int cols, int bs);
+void qsf_matvec_outlier_4bit_neon(const void* QSF_RESTRICT w,
+                                   const float* QSF_RESTRICT in,
+                                   float* QSF_RESTRICT out,
+                                   int rows, int cols, int bs);
 void qsf_vec_add_neon(const float* QSF_RESTRICT a,
                        const float* QSF_RESTRICT b,
                        float* QSF_RESTRICT o, int n);

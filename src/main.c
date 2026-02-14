@@ -39,6 +39,66 @@ static int print_token(uint32_t token_id, const char* text, void* userdata) {
     return 0;  /* 0 = continue */
 }
 
+/* ── Chat template ──────────────────────────────────────────────── */
+/*
+ * Common chat templates for instruction-tuned models.
+ * Applied before tokenization to wrap user prompts properly.
+ */
+typedef enum {
+    CHAT_NONE      = 0,  /* raw prompt, no wrapping */
+    CHAT_MISTRAL   = 1,  /* [INST] {prompt} [/INST] */
+    CHAT_LLAMA     = 2,  /* [INST] {prompt} [/INST] */
+    CHAT_CHATML    = 3,  /* <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n */
+    CHAT_GEMMA     = 4,  /* <start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n */
+    CHAT_PHI       = 5,  /* <|user|>\n{prompt}<|end|>\n<|assistant|>\n */
+    CHAT_QWEN      = 6,  /* <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n */
+    CHAT_AUTO      = 99, /* auto-detect from model arch */
+} ChatTemplate;
+
+static ChatTemplate detect_chat_template(uint32_t arch) {
+    switch (arch) {
+        case QSF_ARCH_MISTRAL:  return CHAT_MISTRAL;
+        case QSF_ARCH_LLAMA:    return CHAT_LLAMA;
+        case QSF_ARCH_GEMMA:    return CHAT_GEMMA;
+        case QSF_ARCH_PHI:      return CHAT_PHI;
+        case QSF_ARCH_QWEN:     return CHAT_QWEN;
+        case QSF_ARCH_MIXTRAL:  return CHAT_MISTRAL;
+        case QSF_ARCH_GPT_OSS:  return CHAT_CHATML;
+        case QSF_ARCH_DEEPSEEK: return CHAT_CHATML;
+        default:                return CHAT_NONE;
+    }
+}
+
+static const char* apply_chat_template(ChatTemplate tmpl, const char* prompt,
+                                         char* buf, size_t buf_size) {
+    if (tmpl == CHAT_NONE || !prompt) return prompt;
+
+    switch (tmpl) {
+        case CHAT_MISTRAL:
+        case CHAT_LLAMA:
+            snprintf(buf, buf_size, "[INST] %s [/INST]", prompt);
+            break;
+        case CHAT_CHATML:
+        case CHAT_QWEN:
+            snprintf(buf, buf_size,
+                     "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                     prompt);
+            break;
+        case CHAT_GEMMA:
+            snprintf(buf, buf_size,
+                     "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n",
+                     prompt);
+            break;
+        case CHAT_PHI:
+            snprintf(buf, buf_size,
+                     "<|user|>\n%s<|end|>\n<|assistant|>\n", prompt);
+            break;
+        default:
+            return prompt;
+    }
+    return buf;
+}
+
 /* ── Usage ───────────────────────────────────────────────────────── */
 static void print_usage(const char* prog) {
     fprintf(stderr,
@@ -52,7 +112,10 @@ static void print_usage(const char* prog) {
         "  -t, --temperature F    Sampling temperature (default: 0.7, 0=greedy)\n"
         "  -k, --top-k N          Top-K sampling (default: 40, 0=disabled)\n"
         "  --top-p F              Top-P nucleus sampling (default: 0.9)\n"
+        "  --repeat-penalty F     Repeat penalty (default: 1.1, 1.0=off)\n"
         "  --seed N               RNG seed (default: 42)\n"
+        "  --chat                 Enable chat template (auto-detect from model)\n"
+        "  --chat-template NAME   Chat template: mistral, llama, chatml, gemma, phi\n"
         "  --ram-budget N         RAM budget in MB (default: auto)\n"
         "  --no-mmap              Disable memory mapping\n"
         "  -v, --verbose          Verbose output (use twice for debug)\n"
@@ -60,9 +123,10 @@ static void print_usage(const char* prog) {
         "\n"
         "Examples:\n"
         "  %s model.qsf -p \"Once upon a time\"\n"
+        "  %s model.qsf --chat -p \"What is gravity?\"\n"
         "  %s model.qsf -p \"Hello\" -t 0 -n 100\n"
         "  %s model.qsf -p \"Explain\" -k 50 --top-p 0.95 --seed 0\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 /* ── Timer ───────────────────────────────────────────────────────── */
@@ -95,11 +159,14 @@ int main(int argc, char** argv) {
     const char* model_path = NULL;
     const char* prompt = NULL;
     int max_tokens = 256;
+    int use_chat = 0;
+    ChatTemplate chat_template = CHAT_NONE;
     QSFSamplingConfig sampling;
     QSFEngineConfig   engine_cfg;
 
     qsf_sampling_config_default(&sampling);
     qsf_engine_config_default(&engine_cfg);
+    sampling.repeat_penalty = 1.1f;  /* default repeat penalty on */
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
@@ -132,9 +199,34 @@ int main(int argc, char** argv) {
             if (++i >= argc) { fprintf(stderr, "Error: --top-p requires argument\n"); return 1; }
             sampling.top_p = (float)atof(argv[i]);
         }
+        else if (!strcmp(argv[i], "--repeat-penalty")) {
+            if (++i >= argc) { fprintf(stderr, "Error: --repeat-penalty requires argument\n"); return 1; }
+            sampling.repeat_penalty = (float)atof(argv[i]);
+        }
         else if (!strcmp(argv[i], "--seed")) {
             if (++i >= argc) { fprintf(stderr, "Error: --seed requires argument\n"); return 1; }
             sampling.seed = (uint64_t)atoll(argv[i]);
+        }
+        else if (!strcmp(argv[i], "--chat")) {
+            use_chat = 1;
+            chat_template = CHAT_AUTO;
+        }
+        else if (!strcmp(argv[i], "--chat-template")) {
+            if (++i >= argc) { fprintf(stderr, "Error: --chat-template requires argument\n"); return 1; }
+            use_chat = 1;
+            if (!strcmp(argv[i], "mistral"))      chat_template = CHAT_MISTRAL;
+            else if (!strcmp(argv[i], "llama"))    chat_template = CHAT_LLAMA;
+            else if (!strcmp(argv[i], "chatml"))   chat_template = CHAT_CHATML;
+            else if (!strcmp(argv[i], "gemma"))    chat_template = CHAT_GEMMA;
+            else if (!strcmp(argv[i], "phi"))      chat_template = CHAT_PHI;
+            else if (!strcmp(argv[i], "qwen"))     chat_template = CHAT_QWEN;
+            else if (!strcmp(argv[i], "none"))     { use_chat = 0; chat_template = CHAT_NONE; }
+            else {
+                fprintf(stderr, "Unknown chat template: %s\n"
+                        "Available: mistral, llama, chatml, gemma, phi, qwen, none\n",
+                        argv[i]);
+                return 1;
+            }
         }
         else if (!strcmp(argv[i], "--ram-budget")) {
             if (++i >= argc) { fprintf(stderr, "Error: --ram-budget requires MB\n"); return 1; }
@@ -188,17 +280,38 @@ int main(int argc, char** argv) {
 
     double t_load = get_time_ms() - t0;
 
+    /* Auto-detect chat template from model architecture */
+    if (use_chat && chat_template == CHAT_AUTO) {
+        chat_template = detect_chat_template(engine.model.header.arch);
+        if (engine_cfg.verbose >= 1 && chat_template != CHAT_NONE) {
+            const char* names[] = {"none","mistral","llama","chatml","gemma","phi","qwen"};
+            int idx = (int)chat_template;
+            if (idx >= 1 && idx <= 6) {
+                fprintf(stderr, "[qstream] Chat template: %s\n", names[idx]);
+            }
+        }
+    }
+
     if (engine_cfg.verbose >= 1) {
         fprintf(stderr, "[qstream] Model loaded in %.1f ms\n", t_load);
     }
 
+    char chat_buf[8192];  /* buffer for chat-templated prompt */
+
     if (prompt) {
+        /* Apply chat template */
+        const char* final_prompt = prompt;
+        if (use_chat && chat_template != CHAT_NONE) {
+            final_prompt = apply_chat_template(chat_template, prompt,
+                                                 chat_buf, sizeof(chat_buf));
+        }
+
         /* Single-shot mode: generate from the supplied prompt */
         fprintf(stderr, "\n");
         int token_count = 0;
         double t_gen = get_time_ms();
 
-        err = qsf_engine_generate(&engine, prompt, max_tokens,
+        err = qsf_engine_generate(&engine, final_prompt, max_tokens,
                                    &sampling, print_token, &token_count);
 
         double elapsed = get_time_ms() - t_gen;
@@ -220,6 +333,9 @@ int main(int argc, char** argv) {
     } else {
         /* Interactive mode: REPL */
         fprintf(stderr, "[qstream] Interactive mode. Type your prompt and press Enter.\n");
+        if (use_chat && chat_template != CHAT_NONE) {
+            fprintf(stderr, "[qstream] Chat mode enabled.\n");
+        }
         fprintf(stderr, "[qstream] Type 'quit' or press Ctrl+C to exit.\n\n");
 
         char line_buf[4096];
@@ -237,11 +353,18 @@ int main(int argc, char** argv) {
             if (len == 0) continue;
             if (strcmp(line_buf, "quit") == 0 || strcmp(line_buf, "exit") == 0) break;
 
+            /* Apply chat template */
+            const char* final_prompt = line_buf;
+            if (use_chat && chat_template != CHAT_NONE) {
+                final_prompt = apply_chat_template(chat_template, line_buf,
+                                                     chat_buf, sizeof(chat_buf));
+            }
+
             engine.interrupted = 0;
             int token_count = 0;
             double t_gen = get_time_ms();
 
-            err = qsf_engine_generate(&engine, line_buf, max_tokens,
+            err = qsf_engine_generate(&engine, final_prompt, max_tokens,
                                        &sampling, print_token, &token_count);
 
             double elapsed = get_time_ms() - t_gen;

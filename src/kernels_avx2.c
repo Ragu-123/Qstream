@@ -416,6 +416,138 @@ void qsf_matvec_2bit_avx2(const void* w, const float* in, float* out,
     free(input_block_sums);
 }
 
+/* ── AVX2 fused dequant-matvec: Outlier-aware 2-bit ──────────────── */
+void qsf_matvec_outlier_2bit_avx2(const void* w, const float* in, float* out,
+                                   int rows, int cols, int bs) {
+    const uint8_t* p = (const uint8_t*)w;
+
+    /* 1. Read outlier header */
+    uint32_t num_outliers;
+    memcpy(&num_outliers, p, 4);
+    p += 4;
+
+    const uint8_t* outlier_entries = p;
+    p += (size_t)num_outliers * 6;
+
+    /* 2. Run standard AVX2 2-bit matvec on base blocks */
+    qsf_matvec_2bit_avx2(p, in, out, rows, cols, bs);
+
+    /* 3. Sparse outlier correction */
+    /* AVX2 optimization: not worth vectorizing sparse random access.
+     * But we can batch the FP16->FP32 conversion using F16C. */
+    const uint8_t* entry = outlier_entries;
+    uint32_t i = 0;
+
+    /* Process batches of 8 outliers for F16C conversion */
+    for (; i + 7 < num_outliers; i += 8) {
+        uint32_t flat_indices[8];
+        uint16_t fp16_vals[8];
+
+        /* Gather 8 entries */
+        for (int k = 0; k < 8; k++) {
+            memcpy(&flat_indices[k], entry, 4);
+            memcpy(&fp16_vals[k], entry + 4, 2);
+            entry += 6;
+        }
+
+        /* Convert 8 FP16 values at once */
+        __m128i vh = _mm_loadu_si128((const __m128i*)fp16_vals);
+        __m256 vf  = _mm256_cvtph_ps(vh);
+        float vals[8];
+        _mm256_storeu_ps(vals, vf);
+
+        /* Apply corrections */
+        for (int k = 0; k < 8; k++) {
+            uint32_t flat_idx = flat_indices[k];
+            int r = (int)(flat_idx / (uint32_t)cols);
+            int c = (int)(flat_idx % (uint32_t)cols);
+            if (r < rows && c < cols) {
+                out[r] += vals[k] * in[c];
+            }
+        }
+    }
+
+    /* Scalar tail */
+    for (; i < num_outliers; i++) {
+        uint32_t flat_idx;
+        uint16_t fp16_val;
+        memcpy(&flat_idx, entry, 4);
+        memcpy(&fp16_val, entry + 4, 2);
+        entry += 6;
+
+        int r = (int)(flat_idx / (uint32_t)cols);
+        int c = (int)(flat_idx % (uint32_t)cols);
+        if (r < rows && c < cols) {
+            /* For single values, scalar conversion is fine or use intrinsic */
+            /* Use intrinsic for consistency if F16C is available (checked in kernels.c) */
+            __m128i vh = _mm_set1_epi16(fp16_val);
+            __m128  vf = _mm_cvtph_ps(vh);
+            float val  = _mm_cvtss_f32(vf);
+            out[r] += val * in[c];
+        }
+    }
+}
+
+/* ── AVX2 fused dequant-matvec: Outlier-aware 4-bit ──────────────── */
+void qsf_matvec_outlier_4bit_avx2(const void* w, const float* in, float* out,
+                                   int rows, int cols, int bs) {
+    const uint8_t* p = (const uint8_t*)w;
+
+    uint32_t num_outliers;
+    memcpy(&num_outliers, p, 4);
+    p += 4;
+
+    const uint8_t* outlier_entries = p;
+    p += (size_t)num_outliers * 6;
+
+    /* Run standard AVX2 4-bit matvec */
+    qsf_matvec_4bit_avx2(p, in, out, rows, cols, bs);
+
+    /* Sparse outlier correction (identical to 2-bit case) */
+    const uint8_t* entry = outlier_entries;
+    uint32_t i = 0;
+
+    for (; i + 7 < num_outliers; i += 8) {
+        uint32_t flat_indices[8];
+        uint16_t fp16_vals[8];
+        for (int k = 0; k < 8; k++) {
+            memcpy(&flat_indices[k], entry, 4);
+            memcpy(&fp16_vals[k], entry + 4, 2);
+            entry += 6;
+        }
+        __m128i vh = _mm_loadu_si128((const __m128i*)fp16_vals);
+        __m256 vf  = _mm256_cvtph_ps(vh);
+        float vals[8];
+        _mm256_storeu_ps(vals, vf);
+
+        for (int k = 0; k < 8; k++) {
+            uint32_t flat_idx = flat_indices[k];
+            int r = (int)(flat_idx / (uint32_t)cols);
+            int c = (int)(flat_idx % (uint32_t)cols);
+            if (r < rows && c < cols) {
+                out[r] += vals[k] * in[c];
+            }
+        }
+    }
+
+    for (; i < num_outliers; i++) {
+        uint32_t flat_idx;
+        uint16_t fp16_val;
+        memcpy(&flat_idx, entry, 4);
+        memcpy(&fp16_val, entry + 4, 2);
+        entry += 6;
+
+        int r = (int)(flat_idx / (uint32_t)cols);
+        int c = (int)(flat_idx % (uint32_t)cols);
+        if (r < rows && c < cols) {
+            __m128i vh = _mm_set1_epi16(fp16_val);
+            __m128  vf = _mm_cvtph_ps(vh);
+            float val  = _mm_cvtss_f32(vf);
+            out[r] += val * in[c];
+        }
+    }
+}
+
 /* ── AVX2 vector add ─────────────────────────────────────────────── */
 void qsf_vec_add_avx2(const float* a, const float* b, float* o, int n) {
     int i = 0;

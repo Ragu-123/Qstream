@@ -10,6 +10,8 @@ void qsf_kernels_init(QSFKernelTable* kt, const QSFPlatformInfo* platform) {
     kt->matvec_3bit    = qsf_matvec_3bit_scalar;
     kt->matvec_4bit    = qsf_matvec_4bit_scalar;
     kt->matvec_4bit_sym = qsf_matvec_4bit_sym_scalar;
+    kt->matvec_outlier_2bit = qsf_matvec_outlier_2bit; /* quant.c fallback */
+    kt->matvec_outlier_4bit = qsf_matvec_outlier_4bit; /* quant.c fallback */
     kt->vec_add        = qsf_vec_add_scalar_impl;
     kt->vec_mul        = qsf_vec_mul_scalar_impl;
     kt->vec_scale      = qsf_vec_scale_scalar_impl;
@@ -27,7 +29,9 @@ void qsf_kernels_init(QSFKernelTable* kt, const QSFPlatformInfo* platform) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     if (platform->has_avx2 && platform->has_fma) {
         kt->matvec_2bit  = qsf_matvec_2bit_avx2;
+        kt->matvec_outlier_2bit = qsf_matvec_outlier_2bit_avx2;
         kt->matvec_4bit  = qsf_matvec_4bit_avx2;
+        kt->matvec_outlier_4bit = qsf_matvec_outlier_4bit_avx2;
         kt->matvec_4bit_sym = qsf_matvec_4bit_sym_avx2;
         kt->vec_add      = qsf_vec_add_avx2;
         kt->vec_mul      = qsf_vec_mul_avx2;
@@ -46,7 +50,9 @@ void qsf_kernels_init(QSFKernelTable* kt, const QSFPlatformInfo* platform) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
     if (platform->has_neon) {
         kt->matvec_2bit  = qsf_matvec_2bit_neon;
+        kt->matvec_outlier_2bit = qsf_matvec_outlier_2bit_neon;
         kt->matvec_4bit  = qsf_matvec_4bit_neon;
+        kt->matvec_outlier_4bit = qsf_matvec_outlier_4bit_neon;
         kt->vec_add      = qsf_vec_add_neon;
         kt->silu         = qsf_silu_neon;
         kt->dot          = qsf_dot_neon;

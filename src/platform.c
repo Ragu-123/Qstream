@@ -4,6 +4,7 @@
  */
 #include "qsf/platform.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ── x86 CPUID ───────────────────────────────────────────────────── */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -69,9 +70,29 @@ uint64_t qsf_get_available_ram(void) {
     GlobalMemoryStatusEx(&ms);
     return ms.ullAvailPhys;
 #elif defined(__linux__)
-    struct sysinfo si;
-    sysinfo(&si);
-    return (uint64_t)si.freeram * si.mem_unit;
+    /* Read MemAvailable from /proc/meminfo — this includes reclaimable
+     * page cache and buffers, giving a much more accurate picture than
+     * sysinfo.freeram (which only reports truly free pages).
+     * On a 12GB Colab, freeram might be 400MB while MemAvailable is 10GB. */
+    {
+        FILE* fp = fopen("/proc/meminfo", "r");
+        if (fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                unsigned long long kb;
+                if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                    fclose(fp);
+                    return (uint64_t)kb * 1024;
+                }
+            }
+            fclose(fp);
+        }
+        /* Fallback to sysinfo if /proc/meminfo unavailable */
+        struct sysinfo si;
+        sysinfo(&si);
+        /* Include buffers + cached as available */
+        return (uint64_t)(si.freeram + si.bufferram) * si.mem_unit;
+    }
 #elif defined(__APPLE__)
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
