@@ -50,6 +50,8 @@ typedef enum {
     QSF_QUANT_8BIT       = 6,
     QSF_QUANT_FP16       = 7,
     QSF_QUANT_MIXED      = 8,
+    QSF_QUANT_2BIT_OUTLIER = 9,   /* 2-bit + FP16 outlier separation */
+    QSF_QUANT_4BIT_OUTLIER = 10,  /* 4-bit + FP16 outlier separation */
     QSF_QUANT_USE_DEFAULT = 0xFF,
 } QSFQuantType;
 

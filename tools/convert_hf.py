@@ -144,166 +144,243 @@ def crc32(data: bytes) -> int:
 
 
 ###############################################################################
-# Quantization
+# Quantization — Vectorized with Outlier-Aware Support
 ###############################################################################
-class Quantizer:
-    """Block quantizer for 2/3/4-bit quantization."""
 
-    def __init__(self, quant_type: int, block_size: int = 64):
+# New quant type for outlier-aware compression
+QUANT_2BIT_OUTLIER = 9   # 2-bit + FP16 outliers
+QUANT_4BIT_OUTLIER = 10  # 4-bit + FP16 outliers
+
+class Quantizer:
+    """Vectorized block quantizer for 2/3/4-bit quantization.
+
+    Uses numpy vectorized operations — NO per-block Python loops.
+    Supports outlier-aware mode: top outlier_frac weights stored as FP16,
+    rest quantized at lower bits with tighter range for better accuracy.
+    """
+
+    def __init__(self, quant_type: int, block_size: int = 64,
+                 outlier_frac: float = 0.0):
         self.quant_type = quant_type
         self.block_size = block_size
+        self.outlier_frac = outlier_frac  # 0.0 = off, 0.005 = 0.5%
 
     def quantize_tensor(self, tensor: np.ndarray) -> Tuple[bytes, int, int]:
         """Quantize a 2D tensor. Returns (packed_bytes, rows, cols)."""
+        if isinstance(tensor, np.ndarray):
+            tensor = tensor.astype(np.float32, copy=False)
+        else:
+            # Handle torch tensors
+            if hasattr(tensor, 'cpu'):
+                tensor = tensor.float().cpu().numpy()
+            else:
+                tensor = np.asarray(tensor, dtype=np.float32)
+
         if tensor.ndim == 1:
             tensor = tensor.reshape(1, -1)
         rows, cols = tensor.shape
-        flat = tensor.flatten().astype(np.float32)
+
+        if self.quant_type == QUANT_FP16:
+            return tensor.astype(np.float16).tobytes(), rows, cols
+
+        # Flatten for block processing
+        flat = tensor.flatten()
         bs = self.block_size
-        num_blocks = (len(flat) + bs - 1) // bs
-        chunks = []
+        n = len(flat)
 
-        for i in range(num_blocks):
-            start = i * bs
-            end = min(start + bs, len(flat))
-            block = flat[start:end]
-            packed = self._quantize_block(block)
-            chunks.append(packed)
+        # Pad to block boundary
+        pad_len = (bs - (n % bs)) % bs
+        if pad_len > 0:
+            flat = np.concatenate([flat, np.zeros(pad_len, dtype=np.float32)])
 
-        return b''.join(chunks), rows, cols
+        # Reshape to blocks: [num_blocks, block_size]
+        blocks = flat.reshape(-1, bs)
 
-    def _quantize_block(self, block: np.ndarray) -> bytes:
-        """Quantize a single block."""
         if self.quant_type == QUANT_4BIT_ASYM:
-            return self._quant_4bit_asym(block)
+            data = self._vec_quant_nbit(blocks, bits=4, symmetric=False)
         elif self.quant_type == QUANT_4BIT_SYM:
-            return self._quant_4bit_sym(block)
+            data = self._vec_quant_nbit_sym(blocks, bits=4)
         elif self.quant_type == QUANT_2BIT_ASYM:
-            return self._quant_2bit_asym(block)
+            data = self._vec_quant_nbit(blocks, bits=2, symmetric=False)
         elif self.quant_type == QUANT_3BIT_ASYM:
-            return self._quant_3bit_asym(block)
-        elif self.quant_type == QUANT_FP16:
-            return self._quant_fp16(block)
+            data = self._vec_quant_3bit(blocks)
+        elif self.quant_type in (QUANT_2BIT_OUTLIER, QUANT_4BIT_OUTLIER):
+            data = self._vec_quant_outlier(flat[:n], rows, cols)
+            return data, rows, cols
         else:
             raise ValueError(f"Unknown quant type: {self.quant_type}")
 
+        return data, rows, cols
+
+    def _vec_quant_nbit(self, blocks, bits, symmetric=False):
+        """Vectorized N-bit asymmetric quantization (2-bit or 4-bit).
+
+        Processes ALL blocks in parallel with numpy — no Python loops.
+
+        Block format: [scale_fp16(2) + zero_fp16(2) + packed_data]
+        """
+        max_val = (1 << bits) - 1  # 3 for 2-bit, 15 for 4-bit
+        nb, bs = blocks.shape
+
+        # 1. Per-block min/max (vectorized)
+        bmin = blocks.min(axis=1)
+        bmax = blocks.max(axis=1)
+
+        # 2. Scale
+        rng = bmax - bmin
+        scale = np.where(rng > 1e-30, rng / float(max_val), 0.0)
+        inv_scale = np.where(scale > 1e-30, 1.0 / scale, 0.0)
+
+        # 3. Quantize all blocks at once
+        vals = (blocks - bmin[:, np.newaxis]) * inv_scale[:, np.newaxis]
+        vals = np.clip(np.round(vals), 0, max_val).astype(np.uint8)
+
+        # 4. Convert scale/min to FP16 bytes
+        scale_fp16 = scale.astype(np.float16).view(np.uint8).reshape(nb, 2)
+        min_fp16 = bmin.astype(np.float16).view(np.uint8).reshape(nb, 2)
+
+        # 5. Pack bits
+        if bits == 4:
+            # Pack two 4-bit values per byte
+            low = vals[:, 0::2]
+            high = vals[:, 1::2]
+            packed = (low | (high << 4)).astype(np.uint8)
+        elif bits == 2:
+            # Pack four 2-bit values per byte
+            packed_len = (bs * 2 + 7) // 8
+            packed = np.zeros((nb, packed_len), dtype=np.uint8)
+            for k in range(4):
+                idx = np.arange(k, bs, 4)
+                byte_idx = idx // 4
+                if len(idx) > 0:
+                    packed[:, byte_idx] |= (vals[:, idx] & 0x03) << (k * 2)
+        else:
+            raise ValueError(f"Unsupported bit width: {bits}")
+
+        # 6. Concatenate: [header(4) + packed_data] per block
+        result = np.concatenate([scale_fp16, min_fp16, packed], axis=1)
+        return result.tobytes()
+
+    def _vec_quant_nbit_sym(self, blocks, bits):
+        """Vectorized N-bit symmetric quantization."""
+        max_val = (1 << (bits - 1)) - 1  # 7 for 4-bit
+        nb, bs = blocks.shape
+
+        absmax = np.abs(blocks).max(axis=1)
+        scale = np.where(absmax > 1e-30, absmax / float(max_val), 0.0)
+        inv_scale = np.where(scale > 1e-30, 1.0 / scale, 0.0)
+
+        vals = blocks * inv_scale[:, np.newaxis]
+        vals = np.clip(np.round(vals), -max_val, max_val).astype(np.int8)
+        # Store as unsigned (offset by max_val+1)
+        vals = (vals + max_val + 1).astype(np.uint8)
+
+        scale_fp16 = scale.astype(np.float16).view(np.uint8).reshape(nb, 2)
+        # 2 bytes padding for format compatibility
+        padding = np.zeros((nb, 2), dtype=np.uint8)
+
+        if bits == 4:
+            low = vals[:, 0::2]
+            high = vals[:, 1::2]
+            packed = (low | (high << 4)).astype(np.uint8)
+        else:
+            raise ValueError("Symmetric only supports 4-bit currently")
+
+        result = np.concatenate([scale_fp16, padding, packed], axis=1)
+        return result.tobytes()
+
+    def _vec_quant_3bit(self, blocks):
+        """Vectorized 3-bit asymmetric quantization."""
+        nb, bs = blocks.shape
+
+        bmin = blocks.min(axis=1)
+        bmax = blocks.max(axis=1)
+        rng = bmax - bmin
+        scale = np.where(rng > 1e-30, rng / 7.0, 0.0)
+        inv_scale = np.where(scale > 1e-30, 1.0 / scale, 0.0)
+
+        vals = (blocks - bmin[:, np.newaxis]) * inv_scale[:, np.newaxis]
+        vals = np.clip(np.round(vals), 0, 7).astype(np.uint8)
+
+        scale_fp16 = scale.astype(np.float16).view(np.uint8).reshape(nb, 2)
+        min_fp16 = bmin.astype(np.float16).view(np.uint8).reshape(nb, 2)
+
+        # Pack 3-bit values into bytes
+        total_bits = bs * 3
+        packed_bytes = (total_bits + 7) // 8
+        packed = np.zeros((nb, packed_bytes), dtype=np.uint8)
+
+        for i in range(bs):
+            bit_pos = i * 3
+            byte_idx = bit_pos // 8
+            bit_off = bit_pos % 8
+            packed[:, byte_idx] |= (vals[:, i] & 0x07) << bit_off
+            if bit_off > 5:
+                packed[:, byte_idx + 1] |= (vals[:, i] & 0x07) >> (8 - bit_off)
+
+        result = np.concatenate([scale_fp16, min_fp16, packed], axis=1)
+        return result.tobytes()
+
+    def _vec_quant_outlier(self, flat, rows, cols):
+        """Outlier-aware quantization: extract top outliers as FP16,
+        quantize remainder at lower bits with tighter range.
+
+        Format: [num_outliers(4)] [outlier_entries(6*N)] [quantized_blocks]
+        Each outlier: [flat_index(4) + fp16_value(2)] = 6 bytes
+        """
+        n = len(flat)
+        frac = self.outlier_frac if self.outlier_frac > 0 else 0.005  # default 0.5%
+        num_outliers = max(1, int(n * frac))
+
+        # Find top outliers by magnitude
+        abs_vals = np.abs(flat)
+        # Use argpartition for O(n) instead of O(n log n) sort
+        outlier_indices = np.argpartition(abs_vals, -num_outliers)[-num_outliers:]
+        outlier_values = flat[outlier_indices].astype(np.float16)
+
+        # Zero out outliers in the tensor
+        flat_clean = flat.copy()
+        flat_clean[outlier_indices] = 0.0
+
+        # Pack outlier entries: [index(u32) + value(fp16)] × N
+        outlier_buf = bytearray(4)  # num_outliers header
+        struct.pack_into('<I', outlier_buf, 0, num_outliers)
+        for idx, val in zip(outlier_indices, outlier_values):
+            outlier_buf += struct.pack('<IH', int(idx), val.view(np.uint16))
+
+        # Quantize the cleaned tensor at the base bit width
+        bs = self.block_size
+        pad_len = (bs - (n % bs)) % bs
+        if pad_len > 0:
+            flat_clean = np.concatenate([flat_clean,
+                                          np.zeros(pad_len, dtype=np.float32)])
+        blocks = flat_clean.reshape(-1, bs)
+
+        if self.quant_type == QUANT_2BIT_OUTLIER:
+            quant_data = self._vec_quant_nbit(blocks, bits=2, symmetric=False)
+        else:
+            quant_data = self._vec_quant_nbit(blocks, bits=4, symmetric=False)
+
+        return bytes(outlier_buf) + quant_data
+
+    # Legacy method names for compatibility
     def _float_to_fp16(self, val: float) -> int:
-        """Convert float32 to IEEE fp16 as uint16."""
         return int(np.float16(val).view(np.uint16))
 
-    def _quant_4bit_asym(self, block: np.ndarray) -> bytes:
-        """4-bit asymmetric: scale(fp16) + min(fp16) + packed nibbles."""
-        n = len(block)
-        bmin = float(block.min())
-        bmax = float(block.max())
-        scale = (bmax - bmin) / 15.0 if bmax != bmin else 1.0
-        inv_scale = 1.0 / scale if scale != 0 else 0.0
-
-        # Header: scale(fp16) + min(fp16) = 4 bytes
-        header = struct.pack('<HH', self._float_to_fp16(scale),
-                             self._float_to_fp16(bmin))
-
-        # Quantize to 0-15 and pack two per byte
-        vals = np.clip(np.round((block - bmin) * inv_scale), 0, 15).astype(np.uint8)
-        packed_bytes = bytearray()
-        for j in range(0, n, 2):
-            lo = vals[j]
-            hi = vals[j + 1] if j + 1 < n else 0
-            packed_bytes.append(lo | (hi << 4))
-
-        return header + bytes(packed_bytes)
-
-    def _quant_4bit_sym(self, block: np.ndarray) -> bytes:
-        """4-bit symmetric: scale(fp16) + packed nibbles (values are -7..+7)."""
-        n = len(block)
-        absmax = float(np.abs(block).max())
-        scale = absmax / 7.0 if absmax > 0 else 1.0
-        inv_scale = 1.0 / scale if scale != 0 else 0.0
-
-        header = struct.pack('<H', self._float_to_fp16(scale))
-
-        # Quantize to -7..+7, store as unsigned 0..15 (offset by 8)
-        vals = np.clip(np.round(block * inv_scale), -7, 7).astype(np.int8) + 8
-        vals = vals.astype(np.uint8)
-        packed_bytes = bytearray()
-        for j in range(0, n, 2):
-            lo = vals[j]
-            hi = vals[j + 1] if j + 1 < n else 8
-            packed_bytes.append(lo | (hi << 4))
-
-        return header + bytes(packed_bytes)
-
-    def _quant_2bit_asym(self, block: np.ndarray) -> bytes:
-        """2-bit asymmetric: scale(fp16) + min(fp16) + packed 2-bit values."""
-        n = len(block)
-        bmin = float(block.min())
-        bmax = float(block.max())
-        scale = (bmax - bmin) / 3.0 if bmax != bmin else 1.0
-        inv_scale = 1.0 / scale if scale != 0 else 0.0
-
-        header = struct.pack('<HH', self._float_to_fp16(scale),
-                             self._float_to_fp16(bmin))
-
-        vals = np.clip(np.round((block - bmin) * inv_scale), 0, 3).astype(np.uint8)
-        packed_bytes = bytearray()
-        for j in range(0, n, 4):
-            byte_val = 0
-            for k in range(4):
-                if j + k < n:
-                    byte_val |= (vals[j + k] & 0x03) << (k * 2)
-            packed_bytes.append(byte_val)
-
-        return header + bytes(packed_bytes)
-
-    def _quant_3bit_asym(self, block: np.ndarray) -> bytes:
-        """3-bit asymmetric: scale(fp16) + min(fp16) + packed 3-bit values."""
-        n = len(block)
-        bmin = float(block.min())
-        bmax = float(block.max())
-        scale = (bmax - bmin) / 7.0 if bmax != bmin else 1.0
-        inv_scale = 1.0 / scale if scale != 0 else 0.0
-
-        header = struct.pack('<HH', self._float_to_fp16(scale),
-                             self._float_to_fp16(bmin))
-
-        vals = np.clip(np.round((block - bmin) * inv_scale), 0, 7).astype(np.uint8)
-        # Pack 3-bit values into bytes (8 values → 3 bytes)
-        packed_bytes = bytearray()
-        bits = 0
-        bit_count = 0
-        for v in vals:
-            bits |= (v & 0x07) << bit_count
-            bit_count += 3
-            while bit_count >= 8:
-                packed_bytes.append(bits & 0xFF)
-                bits >>= 8
-                bit_count -= 8
-        if bit_count > 0:
-            packed_bytes.append(bits & 0xFF)
-
-        return header + bytes(packed_bytes)
-
-    def _quant_fp16(self, block: np.ndarray) -> bytes:
-        """Store as raw FP16."""
-        return block.astype(np.float16).tobytes()
-
     def block_data_size(self, num_elements: int) -> int:
-        """Estimate total quantized size for num_elements."""
         bs = self.block_size
         num_blocks = (num_elements + bs - 1) // bs
         if self.quant_type in (QUANT_4BIT_ASYM,):
             return num_blocks * (4 + bs // 2)
         elif self.quant_type == QUANT_4BIT_SYM:
-            return num_blocks * (2 + bs // 2)
+            return num_blocks * (4 + bs // 2)
         elif self.quant_type == QUANT_2BIT_ASYM:
-            return num_blocks * (4 + bs // 4)
+            return num_blocks * (4 + (bs * 2 + 7) // 8)
         elif self.quant_type == QUANT_3BIT_ASYM:
-            bits = bs * 3
-            data_bytes = (bits + 7) // 8
-            return num_blocks * (4 + data_bytes)
+            return num_blocks * (4 + (bs * 3 + 7) // 8)
         elif self.quant_type == QUANT_FP16:
             return num_elements * 2
-        return num_elements * 4
+        return 0
 
 
 ###############################################################################
@@ -421,6 +498,11 @@ def get_tensor_mapping(arch: str, num_layers: int,
             mapping[f'{p}.self_attn.k_proj.weight'] = ('attn_k_w', L)
             mapping[f'{p}.self_attn.v_proj.weight'] = ('attn_v_w', L)
             mapping[f'{p}.self_attn.o_proj.weight'] = ('attn_o_w', L)
+            # Attention biases (GPT-OSS, Qwen, etc.)
+            mapping[f'{p}.self_attn.q_proj.bias'] = ('attn_q_b', L)
+            mapping[f'{p}.self_attn.k_proj.bias'] = ('attn_k_b', L)
+            mapping[f'{p}.self_attn.v_proj.bias'] = ('attn_v_b', L)
+            mapping[f'{p}.self_attn.o_proj.bias'] = ('attn_o_b', L)
             # Qwen/DeepSeek might use 'c_attn' (fused) or different names? 
             # Usually they follow LLaMA conventions in HF.
 
@@ -486,6 +568,10 @@ class TensorLoader:
         self.model_dir = Path(model_dir)
         self.tensors = {}      # name → (file, key)
         self._detect_format()
+
+    def keys(self):
+        """Yield all tensor names known to this loader."""
+        return self.tensors.keys()
 
     def _detect_format(self):
         """Detect model format and build tensor index."""
@@ -666,6 +752,10 @@ def serialize_tokenizer(tok_data: dict) -> bytes:
 
     num_merges = len(tok_data['merges'])
 
+    # CRC32 of vocab data (required by C reader which skips 4 bytes after vocab)
+    import binascii
+    vocab_crc = binascii.crc32(bytes(vocab_buf)) & 0xFFFFFFFF
+
     # Tokenizer header (32 bytes)
     header = struct.pack('<IIIIIIII',
         tok_data['type'],           # tokenizer_type
@@ -678,7 +768,9 @@ def serialize_tokenizer(tok_data: dict) -> bytes:
         0,                          # flags
     )
 
-    return header + bytes(vocab_buf) + bytes(merge_buf)
+    # Format: [header][vocab_data][crc32][merge_data]
+    # The C reader (tokenizer.c) expects a 4-byte CRC32 between vocab and merges
+    return header + bytes(vocab_buf) + struct.pack('<I', vocab_crc) + bytes(merge_buf)
 
 
 ###############################################################################
@@ -688,22 +780,22 @@ class QSFWriter:
     """Writes QSF format files."""
 
     def __init__(self, output_path: str, config: dict, quant_type: int,
-                 block_size: int = 64, compress: bool = False, device: str = 'cpu'):
+                 block_size: int = 64, compress: bool = False, device: str = 'cpu',
+                 outlier_frac: float = 0.0):
         self.output_path = output_path
         self.config = config
         self.quant_type = quant_type
         self.block_size = block_size
         self.compress = compress and HAS_LZ4
-        
+
         self.device = device
         if device.startswith('cuda') and HAS_TORCH:
             log.info(f"Using GPU quantization on {device}")
             self.quantizer = GPUQuantizer(quant_type, block_size, device)
-            # Norms stay on CPU (fp16) or could be moved? CPU is fine for small norms
-            self.norm_quantizer = Quantizer(QUANT_FP16, block_size)
         else:
-            self.quantizer = Quantizer(quant_type, block_size)
-            self.norm_quantizer = Quantizer(QUANT_FP16, block_size)
+            self.quantizer = Quantizer(quant_type, block_size,
+                                        outlier_frac=outlier_frac)
+        # Norms always use FP16 on CPU (they're tiny)
         self.norm_quantizer = Quantizer(QUANT_FP16, block_size)
 
     def write(self, loader: TensorLoader, arch: str, tok_data: dict):
@@ -825,12 +917,17 @@ class QSFWriter:
         else:
             attn_type = 0  # separate
 
-        # Bias bitfield
+        # Bias bitfield: detect from config
         has_bias = 0
         if arch == 'gpt2':
             has_bias = 0x0F  # all biases
         elif arch == 'phi':
             has_bias = 0x03  # QKV + output bias
+        elif cfg.get('attention_bias', False):
+            has_bias |= 0x01  # QKV bias
+            has_bias |= 0x02  # output bias
+        if cfg.get('mlp_bias', False) or (num_experts > 1 and arch == 'gpt_oss'):
+            has_bias |= 0x04  # FFN/MoE expert bias
 
         # Weight tying
         tie = cfg.get('tie_word_embeddings', arch == 'gpt2')
@@ -840,7 +937,8 @@ class QSFWriter:
         rope_scaling_factor = 1.0
         rope_scaling_cfg = cfg.get('rope_scaling')
         if rope_scaling_cfg:
-            rs_type = rope_scaling_cfg.get('type', '')
+            rs_type = rope_scaling_cfg.get('type',
+                      rope_scaling_cfg.get('rope_type', ''))
             if rs_type == 'linear':
                 rope_scaling_type = 1
                 rope_scaling_factor = rope_scaling_cfg.get('factor', 1.0)
@@ -848,17 +946,26 @@ class QSFWriter:
                 rope_scaling_type = 2
             elif rs_type == 'yarn':
                 rope_scaling_type = 3
+                rope_scaling_factor = rope_scaling_cfg.get('factor', 1.0)
             elif rs_type == 'dynamic':
                 rope_scaling_type = 4
 
         sliding_window = cfg.get('sliding_window', 0) or 0
 
         # Compute param count estimate
-        total_params = (cfg['vocab_size'] * hidden_dim +
-                        cfg['num_hidden_layers'] * (
-                            4 * hidden_dim * hidden_dim +
-                            2 * hidden_dim * cfg.get('intermediate_size', 4 * hidden_dim)
-                        ))
+        intermediate_dim = cfg.get('intermediate_size', 4 * hidden_dim)
+        if num_experts > 1:
+            # MoE: attention + num_experts * expert_ffn + router
+            expert_ffn_params = num_experts * 3 * hidden_dim * intermediate_dim
+            attn_params = 4 * hidden_dim * (num_kv_heads * head_dim + hidden_dim)
+            total_params = (cfg['vocab_size'] * hidden_dim +
+                            cfg['num_hidden_layers'] * (attn_params + expert_ffn_params))
+        else:
+            total_params = (cfg['vocab_size'] * hidden_dim +
+                            cfg['num_hidden_layers'] * (
+                                4 * hidden_dim * hidden_dim +
+                                2 * hidden_dim * intermediate_dim
+                            ))
         num_params_millions = total_params // 1_000_000
 
         # Build header bytes
@@ -1018,9 +1125,14 @@ class QSFWriter:
 
         num_tensors = 0
         layer_buf = bytearray()
+        written_roles = set()  # Prevent duplicate tensor writes (MoE has multiple HF name aliases)
 
         for hf_name, (role, lidx) in mapping.items():
             if lidx != layer_idx:
+                continue
+
+            # Skip if we already wrote this role for this layer
+            if role in written_roles:
                 continue
 
             tensor_type_id = role_to_type.get(role)
@@ -1030,6 +1142,8 @@ class QSFWriter:
             tensor = loader.get_tensor(hf_name)
             if tensor is None:
                 continue
+
+            written_roles.add(role)
 
             # GPT-2 conv1d weights are transposed
             if arch == 'gpt2' and role in ('fused_qkv_w', 'attn_o_w',
@@ -1210,10 +1324,10 @@ class GptOssLoader(TensorLoader):
             COLS = dequanted.shape[1]
             dequanted = dequanted.reshape(E, R, COLS)
 
-            # Split and cache individual experts
+            # Split and cache individual experts (move to CPU to save GPU memory)
             is_gate_up = 'gate_up' in proj
             for e in range(E):
-                expert_data = dequanted[e]  # [R, COLS]
+                expert_data = dequanted[e].float().cpu().numpy()  # [R, COLS]
                 if is_gate_up:
                     split = R // 2
                     self._batch_cache[('gate', e)] = expert_data[:split]
@@ -1460,6 +1574,8 @@ QUANT_TYPE_MAP = {
     '3bit': QUANT_3BIT_ASYM,
     '4bit': QUANT_4BIT_ASYM,
     '4bit_sym': QUANT_4BIT_SYM,
+    '2bit_outlier': QUANT_2BIT_OUTLIER,
+    '4bit_outlier': QUANT_4BIT_OUTLIER,
     'fp16': QUANT_FP16,
 }
 
@@ -1483,6 +1599,8 @@ Examples:
                         help='Quantization block size (default: 64)')
     parser.add_argument('--compress', action='store_true',
                         help='LZ4-compress layer data')
+    parser.add_argument('--outlier-frac', type=float, default=0.0,
+                        help='Outlier fraction (0.005 = 0.5%%). Extract top outliers as FP16.')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Verbose output')
     parser.add_argument('--device', default='cuda' if HAS_TORCH and torch.cuda.is_available() else 'cpu',
@@ -1526,7 +1644,8 @@ Examples:
     writer = QSFWriter(args.output, config, quant_type,
                        block_size=args.block_size,
                        compress=args.compress,
-                       device=args.device)
+                       device=args.device,
+                       outlier_frac=args.outlier_frac)
     writer.write(loader, arch, tok_data)
 
     log.info("Conversion complete!")
@@ -1537,7 +1656,11 @@ Examples:
 # GPU Quantizer (PyTorch-based)
 ###############################################################################
 class GPUQuantizer:
-    """Accelerated quantization using PyTorch on GPU."""
+    """Accelerated quantization using PyTorch on GPU.
+
+    Supports all quant types on GPU (4-bit, 2-bit, 3-bit, fp16) instead of
+    falling back to CPU for non-4-bit types.
+    """
     def __init__(self, quant_type: int, block_size: int = 64, device='cuda'):
         self.quant_type = quant_type
         self.block_size = block_size
@@ -1545,82 +1668,180 @@ class GPUQuantizer:
         if HAS_TORCH:
             self.device = torch.device(device)
 
+    def _to_gpu(self, tensor):
+        """Move tensor to GPU, handling numpy arrays."""
+        if isinstance(tensor, np.ndarray):
+            tensor = torch.from_numpy(tensor)
+        if tensor.dtype != torch.float32:
+            tensor = tensor.float()
+        return tensor.to(self.device)
+
     def quantize_tensor(self, tensor) -> Tuple[bytes, int, int]:
-        """Quantize a tensor on GPU. Input must be a torch tensor (on GPU/CPU)."""
+        """Quantize a tensor on GPU."""
         if not HAS_TORCH:
             raise RuntimeError("GPU quantization requires PyTorch")
-            
+
         if isinstance(tensor, np.ndarray):
-            tensor = torch.from_numpy(tensor).to(self.device)
-            
+            tensor = torch.from_numpy(tensor)
         if tensor.ndim == 1:
             tensor = tensor.unsqueeze(0)
         rows, cols = tensor.shape
-        
-        # Move to GPU if needed
-        if tensor.device.type != 'cuda':
-            tensor = tensor.to(self.device)
-            
-        # Only support 4-bit Asym for fast path
+
+        # Move to GPU
+        tensor = self._to_gpu(tensor)
+
         if self.quant_type == QUANT_4BIT_ASYM:
-            return self._quant_4bit_asym_gpu(tensor), rows, cols
+            return self._quant_nbit_gpu(tensor, 4, symmetric=False), rows, cols
+        elif self.quant_type == QUANT_4BIT_SYM:
+            return self._quant_4bit_sym_gpu(tensor), rows, cols
+        elif self.quant_type == QUANT_2BIT_ASYM:
+            return self._quant_nbit_gpu(tensor, 2, symmetric=False), rows, cols
+        elif self.quant_type == QUANT_3BIT_ASYM:
+            return self._quant_3bit_gpu(tensor), rows, cols
         elif self.quant_type == QUANT_FP16:
-             # Fast FP16 path
-             return tensor.half().cpu().numpy().tobytes(), rows, cols
+            return tensor.half().cpu().numpy().tobytes(), rows, cols
         else:
-            # Fallback for other modes
+            # Fallback for unknown types
             cpu_tensor = tensor.float().cpu().numpy()
             q = Quantizer(self.quant_type, self.block_size)
             return q.quantize_tensor(cpu_tensor)
 
-    def _quant_4bit_asym_gpu(self, tensor: torch.Tensor) -> bytes:
-        # Reshape to blocks: [N_BLOCKS, BLOCK_SIZE]
-        # Pad if needed
+    def _reshape_to_blocks(self, tensor):
+        """Reshape flat tensor to [N_BLOCKS, BLOCK_SIZE], padding if needed."""
         numel = tensor.numel()
         bs = self.block_size
         pad_len = (bs - (numel % bs)) % bs
         if pad_len > 0:
-            tensor = torch.nn.functional.pad(tensor.reshape(-1), (0, pad_len)).reshape(-1, bs)
+            tensor = torch.nn.functional.pad(
+                tensor.reshape(-1), (0, pad_len)).reshape(-1, bs)
         else:
             tensor = tensor.reshape(-1, bs)
-            
-        # 1. Min/Max
+        return tensor
+
+    def _quant_nbit_gpu(self, tensor, bits, symmetric=False):
+        """GPU N-bit asymmetric quantization (2-bit or 4-bit).
+
+        Block format: [scale_fp16(2) + zero_fp16(2) + packed_data]
+        """
+        max_val = (1 << bits) - 1  # 3 for 2-bit, 15 for 4-bit
+        tensor = self._reshape_to_blocks(tensor)
+        bs = tensor.shape[1]
+
+        # 1. Min/Max per block
         bmin = tensor.min(dim=1).values
         bmax = tensor.max(dim=1).values
-        
+
         # 2. Scale
-        scale = (bmax - bmin) / 15.0
-        # mask zero scale
+        scale = (bmax - bmin) / float(max_val)
         mask = (scale == 0)
-        scale[mask] = 1.0 
+        scale[mask] = 1.0
         inv_scale = 1.0 / scale
-        inv_scale[mask] = 0.0 
-        
-        # 3. Quantize
-        # vals = (x - min) * inv_scale
+        inv_scale[mask] = 0.0
+
+        # 3. Quantize all values
         vals = (tensor - bmin.unsqueeze(1)) * inv_scale.unsqueeze(1)
-        vals = vals.round_().clamp_(0, 15).to(torch.uint8)
-        
-        # 4. Pack
-        # 0::2 and 1::2
-        low = vals[:, 0::2]
-        high = vals[:, 1::2]
-        packed_data = (low | (high << 4))
-        
-        # 5. Header (Scale + Min)
-        # Convert scale/min to FP16 
-        # We assume little-endian packing.
-        # Use torch.view to treat float16 as uint8 bytes
+        vals = vals.round_().clamp_(0, max_val).to(torch.uint8)
+
+        # 4. Pack bits and build per-block output
         scale_bytes = scale.to(torch.float16).contiguous().view(torch.uint8)
         min_bytes = bmin.to(torch.float16).contiguous().view(torch.uint8)
-        
-        # Concatenate: [Scale(2), Min(2), Data(32)] per block
-        # scale_bytes is [N_BLOCKS, 2]
-        # min_bytes is [N_BLOCKS, 2]
-        # packed_data is [N_BLOCKS, 32]
-        final = torch.cat([scale_bytes, min_bytes, packed_data], dim=1)
-        
+
+        if bits == 4:
+            # Pack two 4-bit values per byte
+            low = vals[:, 0::2]
+            high = vals[:, 1::2]
+            packed = (low | (high << 4))
+            final = torch.cat([scale_bytes, min_bytes, packed], dim=1)
+        elif bits == 2:
+            # Pack four 2-bit values per byte
+            n_blocks = vals.shape[0]
+            packed_len = (bs * 2 + 7) // 8
+            packed = torch.zeros(n_blocks, packed_len, dtype=torch.uint8,
+                                 device=tensor.device)
+            for k in range(4):
+                idx = torch.arange(k, bs, 4, device=tensor.device)
+                if idx.numel() > 0:
+                    byte_idx = idx // 4
+                    packed[:, byte_idx] |= (vals[:, idx] & 0x03) << (k * 2)
+            final = torch.cat([scale_bytes, min_bytes, packed], dim=1)
+        else:
+            raise ValueError(f"Unsupported bit width: {bits}")
+
         return final.cpu().numpy().tobytes()
+
+    def _quant_4bit_sym_gpu(self, tensor):
+        """GPU 4-bit symmetric quantization.
+
+        Block format: [scale_fp16(2) + packed_data]
+        Values stored as unsigned 0..15 (offset by 8 from signed -7..+7)
+        """
+        tensor = self._reshape_to_blocks(tensor)
+        bs = tensor.shape[1]
+
+        absmax = tensor.abs().max(dim=1).values
+        scale = absmax / 7.0
+        mask = (scale == 0)
+        scale[mask] = 1.0
+        inv_scale = 1.0 / scale
+        inv_scale[mask] = 0.0
+
+        # Quantize to -7..+7, store as unsigned 0..15
+        vals = (tensor * inv_scale.unsqueeze(1)).round_().clamp_(-7, 7)
+        vals = (vals + 8).to(torch.uint8)
+
+        scale_bytes = scale.to(torch.float16).contiguous().view(torch.uint8)
+        # 2 bytes padding to match CPU format (skip scale + 2 reserved)
+        padding = torch.zeros(scale_bytes.shape[0], 2, dtype=torch.uint8,
+                              device=tensor.device)
+
+        low = vals[:, 0::2]
+        high = vals[:, 1::2]
+        packed = (low | (high << 4))
+
+        final = torch.cat([scale_bytes, padding, packed], dim=1)
+        return final.cpu().numpy().tobytes()
+
+    def _quant_3bit_gpu(self, tensor):
+        """GPU 3-bit asymmetric quantization.
+
+        Block format: [scale_fp16(2) + zero_fp16(2) + packed_3bit_data]
+        """
+        tensor = self._reshape_to_blocks(tensor)
+        bs = tensor.shape[1]
+
+        bmin = tensor.min(dim=1).values
+        bmax = tensor.max(dim=1).values
+
+        scale = (bmax - bmin) / 7.0
+        mask = (scale == 0)
+        scale[mask] = 1.0
+        inv_scale = 1.0 / scale
+        inv_scale[mask] = 0.0
+
+        vals = (tensor - bmin.unsqueeze(1)) * inv_scale.unsqueeze(1)
+        vals = vals.round_().clamp_(0, 7).to(torch.uint8)
+
+        # Pack 3-bit values into bytes on CPU (bit-packing is tricky on GPU)
+        vals_cpu = vals.cpu().numpy()
+        n_blocks = vals_cpu.shape[0]
+        total_bits = bs * 3
+        packed_bytes = (total_bits + 7) // 8
+        packed = np.zeros((n_blocks, packed_bytes), dtype=np.uint8)
+
+        for i in range(bs):
+            bit_pos = i * 3
+            byte_idx = bit_pos // 8
+            bit_off = bit_pos % 8
+            packed[:, byte_idx] |= (vals_cpu[:, i] & 0x07) << bit_off
+            if bit_off > 5:
+                packed[:, byte_idx + 1] |= (vals_cpu[:, i] & 0x07) >> (8 - bit_off)
+
+        scale_bytes = scale.to(torch.float16).cpu().contiguous().view(torch.uint8).numpy()
+        min_bytes = bmin.to(torch.float16).cpu().contiguous().view(torch.uint8).numpy()
+
+        # Build final: [scale(2) + min(2) + packed_data] per block
+        final = np.concatenate([scale_bytes, min_bytes, packed], axis=1)
+        return final.tobytes()
 
 
 if __name__ == '__main__':

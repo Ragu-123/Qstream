@@ -51,6 +51,31 @@ void qsf_quant_block_2bit(const float* values, void* out, int count);
 void qsf_quant_block_3bit(const float* values, void* out, int count);
 void qsf_quant_block_4bit(const float* values, void* out, int count);
 
+/*
+ * Outlier-aware dequantization.
+ * Tensor format: [num_outliers(u32)] [outlier_entries(6*N)] [quantized_blocks]
+ * Each outlier entry: [flat_index(u32) + fp16_value(u16)] = 6 bytes
+ *
+ * Dequantizes quantized blocks, then patches in outlier FP16 values at
+ * their original positions. This allows the bulk quantization to use a
+ * tighter range (outliers removed), giving much better accuracy.
+ */
+void qsf_dequant_outlier_2bit(const void* data, size_t data_size,
+                                float* out, int total_elements, int block_size);
+void qsf_dequant_outlier_4bit(const void* data, size_t data_size,
+                                float* out, int total_elements, int block_size);
+
+/*
+ * Outlier-aware fused dequant → matvec.
+ * Combines outlier patching with matrix-vector multiply in one pass.
+ */
+void qsf_matvec_outlier_2bit(const void* data, size_t data_size,
+                               const float* input, float* output,
+                               int rows, int cols, int block_size);
+void qsf_matvec_outlier_4bit(const void* data, size_t data_size,
+                               const float* input, float* output,
+                               int rows, int cols, int block_size);
+
 /* FP16 ↔ FP32 conversions */
 float    qsf_fp16_to_fp32(uint16_t h);
 uint16_t qsf_fp32_to_fp16(float f);

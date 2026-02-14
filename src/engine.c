@@ -148,6 +148,36 @@ static qsf_matvec_fn get_matvec_fn(const QSFKernelTable* kt, uint8_t qt) {
     }
 }
 
+/* Check if quant type is outlier-aware (needs special matvec) */
+static int is_outlier_quant(uint8_t qt) {
+    return qt == QSF_QUANT_2BIT_OUTLIER || qt == QSF_QUANT_4BIT_OUTLIER;
+}
+
+/* Outlier-aware matvec dispatch */
+static void matvec_outlier(uint8_t qt, const void* data, size_t data_size,
+                            const float* input, float* output,
+                            int rows, int cols, int block_size) {
+    if (qt == QSF_QUANT_2BIT_OUTLIER) {
+        qsf_matvec_outlier_2bit(data, data_size, input, output,
+                                  rows, cols, block_size);
+    } else {
+        qsf_matvec_outlier_4bit(data, data_size, input, output,
+                                  rows, cols, block_size);
+    }
+}
+
+/* Unified matvec dispatch: handles both standard and outlier quant types */
+static void do_matvec(const QSFKernelTable* kt, uint8_t qt,
+                       const void* data, size_t data_size,
+                       const float* input, float* output,
+                       int rows, int cols, int bs) {
+    if (is_outlier_quant(qt)) {
+        matvec_outlier(qt, data, data_size, input, output, rows, cols, bs);
+    } else {
+        get_matvec_fn(kt, qt)(data, input, output, rows, cols, bs);
+    }
+}
+
 /* ── Helper: find tensor in decompressed layer data ──────────────── */
 static const void* find_tensor(const uint8_t* layer_data, int num_tensors,
                                 uint16_t target_type, QSFTensorHeader* out_hdr) {
